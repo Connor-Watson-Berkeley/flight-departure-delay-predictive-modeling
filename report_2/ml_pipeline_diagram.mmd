@@ -1,0 +1,35 @@
+flowchart LR
+    %% Input
+    Folds["<b>Input:</b><br/>12M Folds"]
+
+    %% Left column - Data prep and encoding
+    subgraph COL1["<b>Data Processing</b>"]
+        direction TB
+        S1["<b>1: Data Prep</b><br/>Cast, Select, Clean"]
+        S2["<b>2: Imputation</b><br/>Median (4 features)"]
+        S3["<b>3: Encoding</b><br/>OHE (6 categoricals)"]
+        S1 --> S2
+        S1 --> S3
+    end
+
+    %% Middle column - Assembly and model
+    subgraph COL2["<b>Feature Pipeline</b>"]
+        direction TB
+        S4["<b>4: Assembly</b><br/>Combine features"]
+        S5["<b>5: Scaling</b><br/>Standardize"]
+        S6["<b>6: Model</b><br/>Linear Regression"]
+        S4 --> S5 --> S6
+    end
+
+    %% Right column - CV and metrics
+    subgraph COL3["<b>Validation</b>"]
+        direction TB
+        CV["<b>Expanding Window CV</b><br/>5 folds, growing train"]
+        METRICS["<b>Metrics</b><br/>RMSE, MAE, R²<br/>OTPA, SDDR"]
+        CV --> METRICS
+    end
+
+    %% Connections
+    Folds --> COL1
+    COL1 --> COL2
+    COL2 --> COL3
