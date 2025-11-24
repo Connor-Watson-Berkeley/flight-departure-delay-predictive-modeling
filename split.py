@@ -25,12 +25,11 @@ def create_sliding_window_folds(
     validates on the next sequential period (non-overlapping). The last period 
     is reserved for the final test fold.
 
-    Example with n_folds=4 (creates 5 periods total):
+    Example with n_folds=3 (creates 4 periods total):
     - Fold 1: train on period 1, validate on period 2
     - Fold 2: train on period 2, validate on period 3
     - Fold 3: train on period 3, validate on period 4
-    - Fold 4: train on period 4, validate on period 5
-    - Test: train on periods 1-4 combined, test on period 5
+    - Test: train on periods 1-3 combined, test on period 4
 
     Args:
         df: PySpark DataFrame
@@ -165,7 +164,7 @@ def create_sliding_window_folds(
 def _print_sliding_timeline(start_dt, end_dt, period_days, n_folds, test_fold):
     """Print visual timeline of the sliding window cross-validation strategy"""
 
-    n_periods = n_folds + 1 if test_fold else n_folds + 1
+    n_periods = n_folds + 1 if test_fold else n_folds
 
     # Create period labels
     periods = []
@@ -335,7 +334,7 @@ def main():
 
     # Output configuration
     group_folder_path = "dbfs:/student-groups/Group_4_2"
-    n_folds = 4
+    n_folds = 3
 
     # Process each dataset version
     for version, path in dataset_dict.items():
