@@ -25,11 +25,11 @@ def create_sliding_window_folds(
     validates on the next sequential period (non-overlapping). The last period 
     is reserved for the final test fold.
 
-    Example with n_folds=3 (creates 4 periods total):
+    Example with n_folds=3 (creates 4 periods for CV + 1 for test = 5 total):
     - Fold 1: train on period 1, validate on period 2
     - Fold 2: train on period 2, validate on period 3
     - Fold 3: train on period 3, validate on period 4
-    - Test: train on periods 1-3 combined, test on period 4
+    - Test: train on periods 1-4 combined, test on period 5
 
     Args:
         df: PySpark DataFrame
