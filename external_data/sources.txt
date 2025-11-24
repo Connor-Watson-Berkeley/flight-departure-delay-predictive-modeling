@@ -1,0 +1,49 @@
+DATA SOURCES FOR EXTERNAL EVENT DATA
+=====================================
+
+GOVERNMENT SHUTDOWN DATA
+------------------------
+Source: Wikipedia - Government shutdowns in the United States
+URL: https://en.wikipedia.org/wiki/Government_shutdowns_in_the_United_States
+
+Source: Congressional Research Service - Past Government Shutdowns: Key Resources
+URL: https://www.congress.gov/crs-product/R41759
+
+Source: Al Jazeera - A history of US government shutdowns
+URL: https://www.aljazeera.com/news/2025/10/1/a-history-of-us-government-shutdowns-every-closure-and-how-long-it-lasted
+
+Key Findings:
+- December 22, 2018 - January 25, 2019 shutdown (35 days)
+  Impact: Partial shutdown affecting FAA operations and TSA, though both deemed essential services
+- October 1, 2025 - November 12, 2025 shutdown (43 days)
+  Impact: Longest government shutdown in US history; significant federal disruptions
+  Source: https://usafacts.org/articles/government-shutdown-2025-what-to-know/
+
+Note: Current analysis uses 2015-2021 flight data, so only 2018-2019 shutdown overlaps.
+Filter by date when merging with flight dataset.
+
+FAA OPERATIONAL EVENTS DATA
+----------------------------
+Source: FAA Data Portal
+URL: https://www.faa.gov/data
+
+Source: OPSNET (Operations Network)
+URL: https://www.aspm.faa.gov/opsnet/sys/main.asp
+Note: Contains air traffic operations and delay data from FY 1990 onwards
+
+Source: NAS Status (National Airspace System)
+URL: https://nasstatus.faa.gov/
+
+Source: News reports on ATC staffing during 2018-2019 shutdown
+Note: January 2019 saw increased sick-outs and staffing shortages at major facilities
+
+Key Finding: No major FAA strikes during 2015-2021 timeframe
+Note: The 1981 PATCO strike is the most significant ATC strike but falls outside our data range
+
+ADDITIONAL RESOURCES
+--------------------
+FAA could provide facility-specific operational data through OPSNET for more granular analysis
+Consider checking news archives for specific airport operational issues during the study period
+
+DATA COLLECTION DATE: November 20, 2025
+COLLECTED BY: Claude Code (web search)
