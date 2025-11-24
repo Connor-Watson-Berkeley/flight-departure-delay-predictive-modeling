@@ -19,12 +19,13 @@ def create_sliding_window_folds(
     test_fold: bool = True
 ):
     """
-    Create sliding window time-series cross-validation folds with overlap.
+    Create sliding window time-series cross-validation folds without overlap.
 
     Divides data into equal time periods. Each fold trains on one period and
-    validates on the next period. The last period is reserved as a test set.
+    validates on the next sequential period (non-overlapping). The last period 
+    is reserved for the final test fold.
 
-    Example with 5 periods (4 CV folds + 1 test):
+    Example with n_folds=4 (creates 5 periods total):
     - Fold 1: train on period 1, validate on period 2
     - Fold 2: train on period 2, validate on period 3
     - Fold 3: train on period 3, validate on period 4
@@ -75,7 +76,8 @@ def create_sliding_window_folds(
 
     # Calculate total days and period size
     total_days = (end_dt - start_dt).days
-    n_periods = n_folds + 1 if test_fold else n_folds + 1  # +1 for validation period
+    # For n_folds CV folds + 1 test fold = n_folds + 1 periods total
+    n_periods = n_folds + 1 if test_fold else n_folds
     period_days = total_days // n_periods
 
     if period_days == 0:
