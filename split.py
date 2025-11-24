@@ -333,7 +333,7 @@ def main():
 
     # Output configuration
     group_folder_path = "dbfs:/student-groups/Group_4_2"
-    n_folds = 5
+    n_folds = 4
 
     # Process each dataset version
     for version, path in dataset_dict.items():
