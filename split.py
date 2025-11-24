@@ -310,3 +310,66 @@ def save_folds(folds, version="3M", group_folder_path="dbfs:/student-groups/Grou
         val_count = val_df.count()
         print(f"  ✓ Saved {val_count:,} rows")
         print()
+
+
+def main():
+    """
+    Main execution function to create and save temporal cross-validation folds
+    for flight delay prediction datasets.
+
+    Processes 3M and 12M datasets, creates sliding window cross-validation splits,
+    and saves the folds to parquet files.
+    """
+    from pyspark.sql import SparkSession
+
+    # Initialize Spark
+    spark = SparkSession.builder.appName("FlightDelayCV").getOrCreate()
+
+    # Dataset paths
+    dataset_dict = {
+        "3M": "dbfs:/mnt/mids-w261/OTPW_3M/OTPW_3M/OTPW_3M_2015.csv.gz",
+        "12M": "dbfs:/mnt/mids-w261/OTPW_12M/OTPW_12M/OTPW_12M_2015.csv.gz"
+    }
+
+    # Output configuration
+    group_folder_path = "dbfs:/student-groups/Group_4_2"
+    n_folds = 5
+
+    # Process each dataset version
+    for version, path in dataset_dict.items():
+        print(f"\n{'=' * 80}")
+        print(f"Processing {version} Dataset")
+        print(f"{'=' * 80}\n")
+
+        try:
+            # Load dataset
+            print(f"Loading {version} dataset from {path}...")
+            df = spark.read.csv(path, header=True, inferSchema=True)
+            print(f"✓ Loaded {df.count():,} rows\n")
+
+            # Create sliding window folds
+            print(f"Creating {n_folds} cross-validation folds with temporal split...\n")
+            folds = create_sliding_window_folds(
+                df,
+                n_folds=n_folds,
+                test_fold=True,
+                date_col="FL_DATE"
+            )
+
+            # Save folds
+            print(f"Saving {version} folds to {group_folder_path}...\n")
+            save_folds(folds, version=version, group_folder_path=group_folder_path)
+
+            print(f"✓ Successfully processed {version} dataset\n")
+
+        except Exception as e:
+            print(f"✗ Error processing {version} dataset: {str(e)}\n")
+            raise
+
+    print(f"{'=' * 80}")
+    print("All datasets processed successfully!")
+    print(f"{'=' * 80}\n")
+
+
+if __name__ == "__main__":
+    main()
