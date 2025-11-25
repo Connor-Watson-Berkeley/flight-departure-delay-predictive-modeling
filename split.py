@@ -359,13 +359,14 @@ def _print_sliding_timeline(start_dt, end_dt, period_days, n_folds, test_fold):
     print("Legend:  [███] = Training Data    [───] = Validation/Test Data")
 
 
-def save_folds(folds, version="3M", group_folder_path="dbfs:/student-groups/Group_4_2"):
+def save_folds(folds, version="3M", source="CUSTOM", group_folder_path="dbfs:/student-groups/Group_4_2"):
     """
     Save cross-validation folds to parquet files.
 
     Args:
         folds: List of (train_df, val_df) tuples from create_sliding_window_folds
-        version: Data version identifier (e.g., "3M", "12M", "3M_OTPW", "12M_OTPW")
+        version: Data version identifier (e.g., "3M", "12M")
+        source: Data source identifier ("CUSTOM" or "PROVIDED")
         group_folder_path: Base path for saving parquet files
     """
     # Save the folds
@@ -375,14 +376,14 @@ def save_folds(folds, version="3M", group_folder_path="dbfs:/student-groups/Grou
         split_type = "TEST" if is_last_fold else "VAL"
 
         # Save train
-        train_name = f"OTPW_{version}_FOLD_{fold_num}_TRAIN"
+        train_name = f"OTPW_{source}_{version}_FOLD_{fold_num}_TRAIN"
         print(f"Saving Fold {fold_num} train set: {train_name}")
         train_df.write.mode("overwrite").parquet(f"{group_folder_path}/{train_name}.parquet")
         train_count = train_df.count()
         print(f"  ✓ Saved {train_count:,} rows")
 
         # Save validation or test
-        val_name = f"OTPW_{version}_FOLD_{fold_num}_{split_type}"
+        val_name = f"OTPW_{source}_{version}_FOLD_{fold_num}_{split_type}"
         print(f"Saving Fold {fold_num} {split_type.lower()} set: {val_name}")
         val_df.write.mode("overwrite").parquet(f"{group_folder_path}/{val_name}.parquet")
         val_count = val_df.count()
@@ -413,14 +414,14 @@ def main(custom=False):
             "12M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_2015"
         }
         data_format = "parquet"
-        version_suffix = ""
+        source = "CUSTOM"
     else:
         dataset_dict = {
             "3M": "dbfs:/mnt/mids-w261/OTPW_3M/OTPW_3M/OTPW_3M_2015.csv.gz",
             "12M": "dbfs:/mnt/mids-w261/OTPW_12M/OTPW_12M/OTPW_12M_2015.csv.gz"
         }
         data_format = "csv"
-        version_suffix = "_OTPW"
+        source = "PROVIDED"
 
     # Output configuration
     group_folder_path = "dbfs:/student-groups/Group_4_2"
@@ -458,8 +459,7 @@ def main(custom=False):
 
             # Save folds
             print(f"Saving {version} folds to {group_folder_path}...\n")
-            versioned_name = f"{version}{version_suffix}"
-            save_folds(folds, version=versioned_name, group_folder_path=group_folder_path)
+            save_folds(folds, version=version, source=source, group_folder_path=group_folder_path)
 
             print(f"✓ Successfully processed {version} dataset\n")
 
