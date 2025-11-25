@@ -365,7 +365,7 @@ def save_folds(folds, version="3M", group_folder_path="dbfs:/student-groups/Grou
 
     Args:
         folds: List of (train_df, val_df) tuples from create_sliding_window_folds
-        version: Data version identifier (e.g., "3M", "12M", "CUSTOM")
+        version: Data version identifier (e.g., "3M", "12M", "3M_OTPW", "12M_OTPW")
         group_folder_path: Base path for saving parquet files
     """
     # Save the folds
@@ -413,12 +413,14 @@ def main(custom=False):
             "12M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_2015"
         }
         data_format = "parquet"
+        version_suffix = ""
     else:
         dataset_dict = {
             "3M": "dbfs:/mnt/mids-w261/OTPW_3M/OTPW_3M/OTPW_3M_2015.csv.gz",
             "12M": "dbfs:/mnt/mids-w261/OTPW_12M/OTPW_12M/OTPW_12M_2015.csv.gz"
         }
         data_format = "csv"
+        version_suffix = "_OTPW"
 
     # Output configuration
     group_folder_path = "dbfs:/student-groups/Group_4_2"
@@ -456,7 +458,8 @@ def main(custom=False):
 
             # Save folds
             print(f"Saving {version} folds to {group_folder_path}...\n")
-            save_folds(folds, version=version, group_folder_path=group_folder_path)
+            versioned_name = f"{version}{version_suffix}"
+            save_folds(folds, version=versioned_name, group_folder_path=group_folder_path)
 
             print(f"✓ Successfully processed {version} dataset\n")
 
