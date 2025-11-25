@@ -23,7 +23,8 @@ class FlightDelayDataLoader:
         self,
         folder_path="dbfs:/student-groups/Group_4_2",
         n_folds=5,
-        local_mode=False
+        local_mode=False,
+        source="CUSTOM"
     ):
         """
         Initialize the data loader.
@@ -36,6 +37,9 @@ class FlightDelayDataLoader:
         self.folder_path = folder_path
         self.n_folds = n_folds
         self.local_mode = local_mode
+        # Source should be either "CUSTOM" or "PROVIDED" and maps to the
+        # prefix used in saved fold filenames: OTPW_{SOURCE}_{VERSION}_FOLD_...
+        self.source = source
         self.folds = {}
         self.versions = ["3M", "12M"]
         self.numerical_features = [
@@ -106,12 +110,17 @@ class FlightDelayDataLoader:
         """
         folds = []
         for fold_idx in range(1, self.n_folds + 1):
-            train_df = self.load_team_data(f"OTPW_{version}_FOLD_{fold_idx}_TRAIN")
+            # Build dataset names using source (CUSTOM or PROVIDED)
+            train_name = f"OTPW_{self.source}_{version}_FOLD_{fold_idx}_TRAIN"
+            train_df = self.load_team_data(train_name)
+
             if fold_idx != self.n_folds:
-                val_df = self.load_team_data(f"OTPW_{version}_FOLD_{fold_idx}_VAL")
+                val_name = f"OTPW_{self.source}_{version}_FOLD_{fold_idx}_VAL"
+                val_df = self.load_team_data(val_name)
                 folds.append((train_df, val_df))
             else:
-                test_df = self.load_team_data(f"OTPW_{version}_FOLD_{fold_idx}_TEST")
+                test_name = f"OTPW_{self.source}_{version}_FOLD_{fold_idx}_TEST"
+                test_df = self.load_team_data(test_name)
                 folds.append((train_df, test_df))
         return folds
 
