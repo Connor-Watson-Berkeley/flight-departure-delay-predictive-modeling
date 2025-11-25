@@ -8,6 +8,83 @@ on the next sequential period.
 
 from datetime import datetime, timedelta
 from pyspark.sql import functions as F
+from pyspark.sql.functions import col
+
+
+def transform_custom_schema(df):
+    """
+    Transform custom data schema to match OTPW CSV schema.
+    
+    Performs three operations:
+    1. Rename columns from custom naming to OTPW naming
+    2. Drop columns not needed in OTPW format
+    3. Cast columns to appropriate types
+    
+    Args:
+        df: PySpark DataFrame with custom schema
+        
+    Returns:
+        DataFrame with transformed schema matching OTPW
+    """
+    # Rename columns to match OTPW schema
+    rename_map = {
+        'destination_airport_name': 'dest_airport_name',
+        'destination_latitude': 'dest_airport_lat',
+        'destination_longitude': 'dest_airport_lon',
+        'destination_country': 'dest_region',
+        'destination_timezone': 'dest_type',
+        
+        'origin_latitude': 'origin_airport_lat',
+        'origin_longitude': 'origin_airport_lon',
+        'origin_country': 'origin_region',
+        'origin_timezone': 'origin_type',
+    }
+    
+    # Apply renames
+    df_renamed = df
+    for old_name, new_name in rename_map.items():
+        if old_name in df_renamed.columns:
+            df_renamed = df_renamed.withColumnRenamed(old_name, new_name)
+    
+    # Drop unnecessary columns
+    cols_to_drop = [
+        # Diversion columns - all variations
+        'div1_airport', 'div1_airport_id', 'div1_airport_seq_id', 'div1_longest_gtime',
+        'div1_tail_num', 'div1_total_gtime', 'div1_wheels_off', 'div1_wheels_on',
+        'div2_airport', 'div2_airport_id', 'div2_airport_seq_id', 'div2_longest_gtime',
+        'div2_tail_num', 'div2_total_gtime', 'div2_wheels_off', 'div2_wheels_on',
+        'div3_airport', 'div3_airport_id', 'div3_airport_seq_id', 'div3_longest_gtime',
+        'div3_tail_num', 'div3_total_gtime', 'div3_wheels_off', 'div3_wheels_on',
+        'div4_airport', 'div4_airport_id', 'div4_airport_seq_id', 'div4_longest_gtime',
+        'div4_tail_num', 'div4_total_gtime', 'div4_wheels_off', 'div4_wheels_on',
+        'div5_airport', 'div5_airport_id', 'div5_airport_seq_id', 'div5_longest_gtime',
+        'div5_tail_num', 'div5_total_gtime', 'div5_wheels_off', 'div5_wheels_on',
+        # Other diversion-related columns
+        'div_actual_elapsed_time', 'div_airport_landings', 'div_arr_delay',
+        'div_distance', 'div_reached_dest',
+        # Timestamp columns (keep FL_DATE instead)
+        'date_timestamp', 'fl_date_timestamp',
+        # Station distance
+        'station_distance_km',
+        # Weather station columns (not in OTPW)
+        'dest_station_dis', 'dest_station_id', 'dest_station_lat', 'dest_station_lon',
+        'dest_station_name', 'origin_station_dis', 'origin_station_lat',
+        'origin_station_lon', 'origin_station_name', 'station',
+        # Airport code columns (not in OTPW)
+        'dest_iata_code', 'dest_icao', 'origin_iata_code', 'origin_icao',
+        # Metadata
+        '_row_desc'
+    ]
+    
+    # Only drop columns that exist in the dataframe
+    cols_to_drop_existing = [c for c in cols_to_drop if c in df_renamed.columns]
+    if cols_to_drop_existing:
+        df_dropped = df_renamed.drop(*cols_to_drop_existing)
+    else:
+        df_dropped = df_renamed
+    
+    return df_dropped
+from pyspark.sql.functions import col
 
 
 def create_sliding_window_folds(
@@ -313,13 +390,16 @@ def save_folds(folds, version="3M", group_folder_path="dbfs:/student-groups/Grou
         print()
 
 
-def main():
+def main(custom=False):
     """
     Main execution function to create and save temporal cross-validation folds
     for flight delay prediction datasets.
 
     Processes 3M and 12M datasets, creates sliding window cross-validation splits,
     and saves the folds to parquet files.
+    
+    Args:
+        custom: If True, process custom dataset. If False, process provided OTPW dataset.
     """
     from pyspark.sql import SparkSession
 
@@ -327,10 +407,18 @@ def main():
     spark = SparkSession.builder.appName("FlightDelayCV").getOrCreate()
 
     # Dataset paths
-    dataset_dict = {
-        "3M": "dbfs:/mnt/mids-w261/OTPW_3M/OTPW_3M/OTPW_3M_2015.csv.gz",
-        "12M": "dbfs:/mnt/mids-w261/OTPW_12M/OTPW_12M/OTPW_12M_2015.csv.gz"
-    }
+    if custom:
+        dataset_dict = {
+            "3M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_3m",
+            "12M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_2015"
+        }
+        data_format = "parquet"
+    else:
+        dataset_dict = {
+            "3M": "dbfs:/mnt/mids-w261/OTPW_3M/OTPW_3M/OTPW_3M_2015.csv.gz",
+            "12M": "dbfs:/mnt/mids-w261/OTPW_12M/OTPW_12M/OTPW_12M_2015.csv.gz"
+        }
+        data_format = "csv"
 
     # Output configuration
     group_folder_path = "dbfs:/student-groups/Group_4_2"
@@ -339,14 +427,23 @@ def main():
     # Process each dataset version
     for version, path in dataset_dict.items():
         print(f"\n{'=' * 80}")
-        print(f"Processing {version} Dataset")
+        print(f"Processing {version} Dataset {'(CUSTOM)' if custom else '(PROVIDED)'}")
         print(f"{'=' * 80}\n")
 
         try:
             # Load dataset
             print(f"Loading {version} dataset from {path}...")
-            df = spark.read.csv(path, header=True, inferSchema=True)
+            if data_format == "parquet":
+                df = spark.read.parquet(path)
+            else:
+                df = spark.read.csv(path, header=True, inferSchema=True)
             print(f"✓ Loaded {df.count():,} rows\n")
+
+            # Transform custom schema if needed
+            if custom:
+                print(f"Transforming schema to match OTPW format...")
+                df = transform_custom_schema(df)
+                print(f"✓ Schema transformation complete\n")
 
             # Create sliding window folds
             print(f"Creating {n_folds} cross-validation folds with temporal split...\n")
@@ -373,4 +470,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(custom=True)
