@@ -33,6 +33,46 @@ for fold_idx, (train_df, val_df) in enumerate(folds):
     print(f"Fold {fold_idx + 1}: Train={train_df.count()}, Val={val_df.count()}")
 ```
 
+### Usage Example (CUSTOM vs PROVIDED)
+
+Below is a concrete example showing how to load either the custom parquet folds
+or the provided OTPW folds and run cross-validation. The `source` argument
+controls which filename prefix is used when loading saved folds (`OTPW_CUSTOM_...`
+or `OTPW_PROVIDED_...`).
+
+```python
+from cv import FlightDelayDataLoader, FlightDelayCV
+from pyspark.ml import Pipeline
+
+# 1) Load CUSTOM folds (default)
+loader_custom = FlightDelayDataLoader(
+    folder_path="dbfs:/student-groups/Group_4_2",
+    n_folds=4,            # number of CV folds (last fold is test)
+    source="CUSTOM"      # looks for files like OTPW_CUSTOM_3M_FOLD_1_TRAIN
+)
+loader_custom.load()
+
+# 2) Or load PROVIDED OTPW folds
+loader_provided = FlightDelayDataLoader(
+    folder_path="dbfs:/student-groups/Group_4_2",
+    n_folds=4,
+    source="PROVIDED"    # looks for files like OTPW_PROVIDED_3M_FOLD_1_TRAIN
+)
+loader_provided.load()
+
+# 3) Create a simple pipeline (replace with your actual estimator)
+pipeline = Pipeline(stages=[...])
+
+# 4) Run cross-validation on the 3M custom dataset
+cv = FlightDelayCV(estimator=pipeline, version="3M", data_loader=loader_custom)
+metrics_df = cv.fit()       # fits on CV folds (excludes final test fold)
+print(metrics_df)
+
+# Evaluate on the held-out test fold
+cv.evaluate()
+print("Test metrics:", cv.test_metric)
+```
+
 ### Run Cross-Validation
 
 ```python
