@@ -22,9 +22,9 @@ class FlightDelayDataLoader:
     def __init__(
         self,
         folder_path="dbfs:/student-groups/Group_4_2",
-        n_folds=5,
+        n_folds=3,
         local_mode=False,
-        source="CUSTOM"
+        source="CUSTOM",
     ):
         """
         Initialize the data loader.
@@ -123,6 +123,11 @@ class FlightDelayDataLoader:
                 test_df = self.load_team_data(test_name)
                 folds.append((train_df, test_df))
         return folds
+
+    # Note: fold count defaults to the `n_folds` provided at initialization
+    # (default is 3). There's no autodetection logic here — this keeps the
+    # behavior deterministic and in sync with `split.py` which produces 3 CV
+    # folds plus 1 test fold by default.
 
     def load(self):
         """Load all versions of the data."""
