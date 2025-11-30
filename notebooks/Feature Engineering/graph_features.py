@@ -14,7 +14,7 @@ from graphframes import GraphFrame
 class GraphFeaturesModel(Model):
     """Model returned by GraphFeaturesEstimator after fitting"""
     
-    def __init__(self, pagerank_scores, origin_col, dest_col):
+    def __init__(self, pagerank_scores=None, origin_col="origin", dest_col="dest"):
         super(GraphFeaturesModel, self).__init__()
         self.pagerank_scores = pagerank_scores
         self.origin_col = origin_col
@@ -22,6 +22,9 @@ class GraphFeaturesModel(Model):
     
     def _transform(self, df):
         """Join PageRank scores to input DataFrame"""
+        if self.pagerank_scores is None:
+            raise ValueError("Model must be fitted before transform()")
+        
         # Join PageRank scores for origin and destination airports
         df_with_features = (
             df
