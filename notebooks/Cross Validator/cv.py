@@ -34,19 +34,49 @@ TOTAL_FOLDS = 4
 class FlightDelayDataLoader:
     def __init__(self):
         self.folds = {}
+        self.numerical_features = [
+            'hourlyprecipitation',
+            'hourlysealevelpressure',
+            'hourlyaltimetersetting',
+            'hourlywetbulbtemperature',
+            'hourlystationpressure',
+            'hourlywinddirection',
+            'hourlyrelativehumidity',
+            'hourlywindspeed',
+            'hourlydewpointtemperature',
+            'hourlydrybulbtemperature',
+            'hourlyvisibility',
+            'crs_elapsed_time',
+            'distance',
+            'elevation',
+        ]
 
-    def _load_parquet(self, name):
-        spark = SparkSession.builder.getOrCreate()
-        df = spark.read.parquet(f"{FOLDER_PATH}/{name}.parquet")
-
-        # Defensive casting for labels (prevents type/null weirdness later)
+    def _cast_numerics(self, df):
+        """Safely cast all configured numeric columns to doubles."""
+        NULL_PAT = r'^(NA|N/A|NULL|null|None|none|\\N|\\s*|\\.|M|T)$'
+        
+        for colname in self.numerical_features:
+            if colname in df.columns:
+                df = df.withColumn(
+                    colname,
+                    F.regexp_replace(F.col(colname).cast("string"), NULL_PAT, "")
+                    .cast("double")
+                )
+        
+        # Explicitly cast labels to expected numeric types
         if "DEP_DELAY" in df.columns:
             df = df.withColumn("DEP_DELAY", col("DEP_DELAY").cast("double"))
         if "DEP_DEL15" in df.columns:
             df = df.withColumn("DEP_DEL15", col("DEP_DEL15").cast("int"))
         if "SEVERE_DEL60" in df.columns:
             df = df.withColumn("SEVERE_DEL60", col("SEVERE_DEL60").cast("int"))
+        
+        return df
 
+    def _load_parquet(self, name):
+        spark = SparkSession.builder.getOrCreate()
+        df = spark.read.parquet(f"{FOLDER_PATH}/{name}.parquet")
+        df = self._cast_numerics(df)
         return df
 
     def _load_version(self, version):
