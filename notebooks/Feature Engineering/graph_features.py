@@ -7,7 +7,7 @@ Computes PageRank features (weighted and unweighted) from flight network graph.
 
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.functions import col
-from pyspark.ml.base import Estimator, Model, Transformer
+from pyspark.ml.base import Estimator, Model
 from graphframes import GraphFrame
 
 
@@ -119,13 +119,11 @@ class GraphFeaturesEstimator(Estimator):
     
     def _create_weighted_edges(self, edges):
         """Create weighted graph using duplication workaround"""
-        from pyspark.sql.functions import explode, sequence, lit
-        
         # Duplicate edges based on weight using sequence and explode
         edges_weighted = (
             edges
-            .withColumn("seq", F.sequence(lit(0), col("weight").cast("int") - 1))
-            .select("src", "dst", explode("seq").alias("_"))
+            .withColumn("seq", F.sequence(F.lit(0), col("weight").cast("int") - 1))
+            .select("src", "dst", F.explode("seq").alias("_"))
             .select("src", "dst")
         )
         return edges_weighted
