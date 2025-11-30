@@ -119,7 +119,7 @@ class GraphFeaturesTransformer(Transformer):
         
         return self
     
-    def transform(self, df):
+    def _transform(self, df):
         """Join PageRank scores to input DataFrame"""
         if self.pagerank_scores is None:
             raise ValueError("Transformer must be fitted before transform()")
