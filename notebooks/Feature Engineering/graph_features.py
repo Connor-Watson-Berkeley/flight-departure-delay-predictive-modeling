@@ -127,7 +127,7 @@ class GraphFeaturesEstimator(Estimator):
         )
         return edges_weighted
     
-    def fit(self, df):
+    def _fit(self, df):
         """Build graph from training data and compute PageRank scores"""
         # Set checkpoint directory
         sc = self._spark.sparkContext
