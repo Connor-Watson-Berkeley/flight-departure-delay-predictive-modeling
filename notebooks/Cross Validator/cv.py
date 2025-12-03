@@ -183,8 +183,12 @@ class FlightDelayCV:
         self.estimator = estimator
         self.version = version
 
-        self.data_loader = FlightDelayDataLoader()
-        self.data_loader.load()
+        if dataloader:
+            self.data_loader = dataloader
+        else:
+            self.data_loader = FlightDelayDataLoader()
+            self.data_loader.load()
+
 
         self.evaluator = FlightDelayEvaluator()
         self.folds = self.data_loader.get_version(version)
