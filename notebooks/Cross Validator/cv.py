@@ -179,7 +179,7 @@ class FlightDelayEvaluator:
 # CROSS-VALIDATOR (NO PARAMS)
 # -----------------------------
 class FlightDelayCV:
-    def __init__(self, estimator, version, data_loader = None):
+    def __init__(self, estimator, version, dataloader = None):
         self.estimator = estimator
         self.version = version
 
@@ -188,7 +188,6 @@ class FlightDelayCV:
         else:
             self.data_loader = FlightDelayDataLoader()
             self.data_loader.load()
-
 
         self.evaluator = FlightDelayEvaluator()
         self.folds = self.data_loader.get_version(version)
