@@ -343,16 +343,21 @@ class FlightDelayCV:
         num_cv_folds = n_folds - 1
         
         # Determine total number of sections
+        # Minimum required: enough sections so max_possible_cv_folds >= num_cv_folds
+        # max_possible_cv_folds = total_sections - train_window_sections - 1
+        # So: total_sections - train_window_sections - 1 >= num_cv_folds
+        # Therefore: total_sections >= train_window_sections + num_cv_folds + 1
         if n_sections is not None:
             total_sections = n_sections
-            required_sections = num_cv_folds + train_window_sections
+            required_sections = train_window_sections + num_cv_folds + 1
             if total_sections < required_sections:
                 raise ValueError(
                     f"Specified n_sections={n_sections} is insufficient for requested folds. "
-                    f"Need at least {required_sections} sections ({num_cv_folds} CV folds + {train_window_sections} training sections)."
+                    f"Need at least {required_sections} sections (max_possible_cv_folds = {total_sections} - {train_window_sections} - 1 = {total_sections - train_window_sections - 1}, need {num_cv_folds})."
                 )
         else:
-            required_sections = num_cv_folds + train_window_sections
+            # Auto-calculate: train_window_sections + num_cv_folds + 1
+            required_sections = train_window_sections + num_cv_folds + 1
             total_sections = required_sections
         
         # Calculate section duration and create section boundaries
@@ -398,7 +403,8 @@ class FlightDelayCV:
             folds.append((train_df, val_df))
         
         # Test fold: train_window_sections sections for training, last section for test
-        test_train_start = section_boundaries[total_sections - train_window_sections - 1]
+        # Use sections just before the last section for test training to avoid overlap with last CV fold
+        test_train_start = section_boundaries[total_sections - train_window_sections]
         test_train_end = section_boundaries[total_sections - 1]
         test_start = test_train_end
         test_end = section_boundaries[total_sections]
@@ -432,11 +438,13 @@ class FlightDelayCV:
                 - Works for all dataset sizes (3M, 12M, 60M) - sections scale proportionally
                 - Example: 3M dataset with train_window_sections=2 → starts with 2 sections, expands
         
-        Example (5 sections for 5-year dataset, n_folds=4, train_window_sections=2):
+        Example (5 sections for 5-year dataset, n_folds=3, train_window_sections=2):
         - TF1: sections 1&2 (2015-2016), CVF1: section 3 (2017)
         - TF2: sections 1&2&3 (2015-2017), CVF2: section 4 (2018)
-        - TF3: sections 1&2&3&4 (2015-2018), CVF3: section 5 (2019)
         - Test: sections 1-4 (2015-2018), Test: section 5 (2019)
+        
+        Note: With n_folds=3, requires 5 sections (2 initial training + 2 CV folds expansion + 1 test).
+              With n_folds=4, requires 6 sections (2 initial training + 3 CV folds expansion + 1 test).
         
         Note: All data filtering uses Spark - pandas.date_range only generates boundary dates.
         Note: Use n_sections parameter to specify exact number of sections (e.g., n_sections=5 for 5-year dataset).
