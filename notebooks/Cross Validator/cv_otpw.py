@@ -1,5 +1,7 @@
 """
-cv.py (simplified, CUSTOM-only, no parametrization)
+cv_otpw.py (simplified, OTPW-only, no parametrization)
+
+Indri's hacky modified version of cv.py for OTPW data
 
 Assumptions:
 - Folds were created from split.py with N_FOLDS = 3 and CREATE_TEST_FOLD = True
@@ -8,7 +10,7 @@ Assumptions:
 - Files live in:
     dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed
 - File naming:
-    OTPW_CUSTOM_{VERSION}_FOLD_{i}_{TRAIN|VAL|TEST}.parquet
+    OTPW_OTPW_{VERSION}_FOLD_{i}_{TRAIN|VAL|TEST}.parquet
 """
 
 from pyspark.sql import SparkSession, functions as F
@@ -21,8 +23,8 @@ import pandas as pd
 # HARD-CODED GLOBALS
 # -----------------------------
 FOLDER_PATH = "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed"
-SOURCE = "CUSTOM"
-VERSIONS = ["3M", "12M", "60M"]
+SOURCE = "OTPW"
+VERSIONS = ["3M"]
 
 # 3 CV folds + 1 test fold = 4 total fold indices
 TOTAL_FOLDS = 4
@@ -35,20 +37,20 @@ class FlightDelayDataLoader:
     def __init__(self):
         self.folds = {}
         self.numerical_features = [
-            'hourlyprecipitation',
-            'hourlysealevelpressure',
-            'hourlyaltimetersetting',
-            'hourlywetbulbtemperature',
-            'hourlystationpressure',
-            'hourlywinddirection',
-            'hourlyrelativehumidity',
-            'hourlywindspeed',
-            'hourlydewpointtemperature',
-            'hourlydrybulbtemperature',
-            'hourlyvisibility',
-            'crs_elapsed_time',
-            'distance',
-            'elevation',
+            'HourlyPrecipitation',
+            'HourlySeaLevelPressure',
+            'HourlyAltimeterSetting',
+            'HourlyWetBulbTemperature',
+            'HourlyStationPressure',
+            'HourlyWindDirection',
+            'HourlyRelativeHumidity',
+            'HourlyWindSpeed',
+            'HourlyDewPointTemperature',
+            'HourlyDryBulbTemperature',
+            'HourlyVisibility',
+            'CRS_ELAPSED_TIME',
+            'DISTANCE',
+            'ELEVATION',
         ]
 
     def _cast_numerics(self, df):
