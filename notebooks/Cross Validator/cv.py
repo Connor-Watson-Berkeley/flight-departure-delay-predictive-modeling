@@ -255,6 +255,35 @@ class FlightDelayCV:
         self.test_metric = None
         self.test_model = None
     
+    def _get_date_range(self, version):
+        """Get min/max date range from existing folds without loading all data."""
+        all_folds = self.data_loader.get_version(version)
+        
+        # Get date ranges from each fold without loading full data
+        date_ranges = []
+        for train_df, val_df in all_folds:
+            # Get min/max from train and val separately (more efficient than unioning first)
+            train_dates = train_df.select(
+                F.min(F.col("FL_DATE")).alias("min_date"),
+                F.max(F.col("FL_DATE")).alias("max_date")
+            ).first()
+            val_dates = val_df.select(
+                F.min(F.col("FL_DATE")).alias("min_date"),
+                F.max(F.col("FL_DATE")).alias("max_date")
+            ).first()
+            
+            date_ranges.extend([
+                train_dates["min_date"], train_dates["max_date"],
+                val_dates["min_date"], val_dates["max_date"]
+            ])
+        
+        # Filter out None values and get overall min/max
+        valid_dates = [d for d in date_ranges if d is not None]
+        if not valid_dates:
+            raise ValueError("No valid dates found in folds")
+        
+        return min(valid_dates), max(valid_dates)
+    
     def _get_full_dataset(self, version):
         """Helper method to load and combine all fold data into full dataset.
         
@@ -338,17 +367,12 @@ class FlightDelayCV:
         """
         import pandas as pd
         
-        full_df = self._get_full_dataset(version)
-        
-        # Get date range using Spark
-        date_range = full_df.select(
-            F.min(F.col("FL_DATE")).alias("min_date"),
-            F.max(F.col("FL_DATE")).alias("max_date")
-        ).first()
-        
-        min_date = date_range["min_date"]
-        max_date = date_range["max_date"]
+        # Get date range first without loading all data (optimization)
+        min_date, max_date = self._get_date_range(version)
         total_days = (max_date - min_date).days
+        
+        # Now load full dataset (needed for filtering)
+        full_df = self._get_full_dataset(version)
         
         num_cv_folds = n_folds - 1
         
@@ -461,17 +485,12 @@ class FlightDelayCV:
         """
         import pandas as pd
         
-        full_df = self._get_full_dataset(version)
-        
-        # Get date range using Spark
-        date_range = full_df.select(
-            F.min(F.col("FL_DATE")).alias("min_date"),
-            F.max(F.col("FL_DATE")).alias("max_date")
-        ).first()
-        
-        min_date = date_range["min_date"]
-        max_date = date_range["max_date"]
+        # Get date range first without loading all data (optimization)
+        min_date, max_date = self._get_date_range(version)
         total_days = (max_date - min_date).days
+        
+        # Now load full dataset (needed for filtering)
+        full_df = self._get_full_dataset(version)
         
         num_cv_folds = n_folds - 1
         
