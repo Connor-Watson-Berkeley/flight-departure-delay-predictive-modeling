@@ -1,2 +1,11 @@
 # Instructions directory
 instructions/
+
+# Test files
+notebooks/Cross Validator/test_cv.py
+
+# Custom Joins - ignore everything except notebooks, design doc, and flight_lineage.py
+Custom Joins/*
+!Custom Joins/*.ipynb
+!Custom Joins/FLIGHT_LINEAGE_JOIN_DESIGN.md
+!Custom Joins/flight_lineage.py
