@@ -279,6 +279,10 @@ def _compute_cumulative_features(df, tail_num_col):
         ).otherwise(None)
     )
     
+    # Scheduled taxi and turn time are the same as scheduled turnover time
+    df = df.withColumn('lineage_taxi_time_minutes', col('lineage_turnover_time_minutes'))
+    df = df.withColumn('lineage_turn_time_minutes', col('lineage_turnover_time_minutes'))
+    
     df = df.withColumn(
         'lineage_expected_flight_time_minutes',
         F.when(
