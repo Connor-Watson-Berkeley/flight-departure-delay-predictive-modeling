@@ -258,6 +258,27 @@ def _compute_cumulative_features(df, tail_num_col):
         ).otherwise(None)
     )
     
+    # Convert prev_flight_crs_arr_time to minutes for turnover time calculation
+    df = df.withColumn(
+        'prev_flight_crs_arr_time_minutes',
+        F.when(
+            col('prev_flight_crs_arr_time').isNotNull(),
+            (F.floor(col('prev_flight_crs_arr_time') / 100) * 60 + (col('prev_flight_crs_arr_time') % 100))
+        ).otherwise(None)
+    )
+    
+    # Compute scheduled turnover time (time between prev flight's scheduled arrival and current flight's scheduled departure)
+    df = df.withColumn(
+        'lineage_turnover_time_minutes',
+        F.when(
+            (col('prev_flight_crs_arr_time_minutes').isNotNull()) & (col('crs_dep_time_minutes').isNotNull()),
+            F.when(
+                col('crs_dep_time_minutes') >= col('prev_flight_crs_arr_time_minutes'),
+                col('crs_dep_time_minutes') - col('prev_flight_crs_arr_time_minutes')
+            ).otherwise(col('crs_dep_time_minutes') + 1440 - col('prev_flight_crs_arr_time_minutes'))
+        ).otherwise(None)
+    )
+    
     df = df.withColumn(
         'lineage_expected_flight_time_minutes',
         F.when(
