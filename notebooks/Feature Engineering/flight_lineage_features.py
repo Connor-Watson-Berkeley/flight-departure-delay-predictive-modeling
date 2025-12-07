@@ -26,6 +26,7 @@ from pyspark.sql.functions import (
 )
 import pyspark.sql.functions as F
 from pyspark.sql.window import Window
+from datetime import datetime
 
 
 def add_flight_lineage_features(df):
@@ -60,6 +61,9 @@ def add_flight_lineage_features(df):
     - Data leakage flags are added for all risky columns
     - See FLIGHT_LINEAGE_JOIN_DESIGN.md for complete documentation
     """
+    start_time = datetime.now()
+    timestamp = start_time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] Generating flight lineage features...")
     print("=" * 60)
     print("FLIGHT LINEAGE JOIN")
     print("=" * 60)
@@ -136,11 +140,16 @@ def add_flight_lineage_features(df):
     df = _apply_imputation(df)
     print("✓ Imputation complete - all NULLs replaced with design doc values")
     
+    end_time = datetime.now()
+    duration = end_time - start_time
+    timestamp = end_time.strftime("%Y-%m-%d %H:%M:%S")
+    
     print("\n" + "=" * 60)
     print("✓ FLIGHT LINEAGE JOIN COMPLETE")
     print("=" * 60)
     print(f"\nNew columns added: ~38 lineage features")
     print(f"All flights preserved - no rows dropped")
+    print(f"[{timestamp}] ✓ Flight lineage feature generation complete! (took {duration})")
     print("=" * 60)
     
     return df

@@ -31,7 +31,7 @@ import pandas as pd
 # -----------------------------
 FOLDER_PATH = "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed"
 SOURCE = "CUSTOM"
-VERSIONS = ["3M", "12M"]
+VERSIONS = ["3M", "12M", "60M"]
 
 # 3 CV folds + 1 test fold = 4 total fold indices
 TOTAL_FOLDS = 4

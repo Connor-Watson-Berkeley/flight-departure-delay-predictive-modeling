@@ -10,12 +10,13 @@ from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.functions import col, to_timestamp, when
 from pyspark.ml.base import Estimator, Model
 import pandas as pd
-from prophet import Prophet
 from datetime import datetime
 
-# Suppress verbose cmdstanpy output
+# Suppress verbose cmdstanpy output BEFORE importing Prophet
 import logging
-logging.getLogger('cmdstanpy').setLevel(logging.WARNING)
+logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
+
+from prophet import Prophet
 
 
 class TimeSeriesFeaturesModel(Model):
@@ -385,4 +386,3 @@ class TimeSeriesFeaturesEstimator(Estimator):
             carrier_col=self.carrier_col,
             origin_col=self.origin_col
         )
-
