@@ -42,31 +42,57 @@ class TimeSeriesFeaturesModel(Model):
         # Join global features (by date)
         if self.global_features is not None:
             global_spark = self._spark.createDataFrame(self.global_features)
-            df_with_features = df_with_features.join(
-                global_spark,
-                col(self.date_col) == col("date_str"),
-                "left"
+            # Select only feature columns (exclude join keys to avoid ambiguity)
+            global_feature_cols = [c for c in global_spark.columns if c not in ['ds', 'date_str']]
+            # Rename join key to avoid ambiguity, keep feature column names as-is
+            global_spark_features = global_spark.select(
+                [col("date_str").alias("global_date_str")] + 
+                [col(c) for c in global_feature_cols]
             )
+            
+            df_with_features = df_with_features.join(
+                global_spark_features,
+                col(self.date_col) == col("global_date_str"),
+                "left"
+            ).drop("global_date_str")  # Drop the join key after joining
         
         # Join carrier features (by carrier and date)
         if self.carrier_features is not None:
             carrier_spark = self._spark.createDataFrame(self.carrier_features)
-            df_with_features = df_with_features.join(
-                carrier_spark,
-                (col(self.carrier_col) == col("carrier")) & 
-                (col(self.date_col) == col("date_str")),
-                "left"
+            # Select only feature columns (exclude join keys to avoid ambiguity)
+            carrier_feature_cols = [c for c in carrier_spark.columns if c not in ['ds', 'date_str', 'carrier']]
+            # Rename join keys to avoid ambiguity, keep feature column names as-is
+            carrier_spark_features = carrier_spark.select(
+                [col("carrier").alias("carrier_join_key"),
+                 col("date_str").alias("carrier_date_str")] + 
+                [col(c) for c in carrier_feature_cols]
             )
+            
+            df_with_features = df_with_features.join(
+                carrier_spark_features,
+                (col(self.carrier_col) == col("carrier_join_key")) & 
+                (col(self.date_col) == col("carrier_date_str")),
+                "left"
+            ).drop("carrier_join_key", "carrier_date_str")  # Drop join keys after joining
         
         # Join airport features (by origin airport and date)
         if self.airport_features is not None:
             airport_spark = self._spark.createDataFrame(self.airport_features)
-            df_with_features = df_with_features.join(
-                airport_spark,
-                (col(self.origin_col) == col("origin")) & 
-                (col(self.date_col) == col("date_str")),
-                "left"
+            # Select only feature columns (exclude join keys to avoid ambiguity)
+            airport_feature_cols = [c for c in airport_spark.columns if c not in ['ds', 'date_str', 'origin']]
+            # Rename join keys to avoid ambiguity, keep feature column names as-is
+            airport_spark_features = airport_spark.select(
+                [col("origin").alias("airport_join_key"),
+                 col("date_str").alias("airport_date_str")] + 
+                [col(c) for c in airport_feature_cols]
             )
+            
+            df_with_features = df_with_features.join(
+                airport_spark_features,
+                (col(self.origin_col) == col("airport_join_key")) & 
+                (col(self.date_col) == col("airport_date_str")),
+                "left"
+            ).drop("airport_join_key", "airport_date_str")  # Drop join keys after joining
         
         # Ensure all expected Prophet columns exist (create with NULL if missing)
         # This prevents imputer from failing if some features weren't generated
@@ -142,29 +168,25 @@ class TimeSeriesFeaturesEstimator(Estimator):
         if len(prophet_data) < self.min_days_required:
             return None
         
-        try:
-            # Determine seasonality based on data availability
-            has_enough_for_yearly = len(prophet_data) >= 365
-            has_enough_for_weekly = len(prophet_data) >= 14
-            
-            # Fit Prophet model
-            prophet_model = Prophet(
-                yearly_seasonality=has_enough_for_yearly,
-                weekly_seasonality=has_enough_for_weekly,
-                daily_seasonality=False,
-                seasonality_mode='multiplicative',
-                interval_width=0.95,
-                changepoint_prior_scale=self.changepoint_prior_scale
-            )
-            prophet_model.fit(prophet_data)
-            
-            # Generate forecast
-            forecast = prophet_model.predict(prophet_data[['ds']])
-            
-            return forecast
-        except Exception as e:
-            print(f"Error fitting Prophet model: {str(e)}")
-            return None
+        # Determine seasonality based on data availability
+        has_enough_for_yearly = len(prophet_data) >= 365
+        has_enough_for_weekly = len(prophet_data) >= 14
+        
+        # Fit Prophet model
+        prophet_model = Prophet(
+            yearly_seasonality=has_enough_for_yearly,
+            weekly_seasonality=has_enough_for_weekly,
+            daily_seasonality=False,
+            seasonality_mode='multiplicative',
+            interval_width=0.95,
+            changepoint_prior_scale=self.changepoint_prior_scale
+        )
+        prophet_model.fit(prophet_data)
+        
+        # Generate forecast
+        forecast = prophet_model.predict(prophet_data[['ds']])
+        
+        return forecast
     
     def _fit(self, df):
         """Generate time-series aggregations and fit Prophet models"""
