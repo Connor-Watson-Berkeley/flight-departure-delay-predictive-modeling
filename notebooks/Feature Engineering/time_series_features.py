@@ -11,6 +11,11 @@ from pyspark.sql.functions import col, to_timestamp, when
 from pyspark.ml.base import Estimator, Model
 import pandas as pd
 from prophet import Prophet
+from datetime import datetime
+
+# Suppress verbose cmdstanpy output
+import logging
+logging.getLogger('cmdstanpy').setLevel(logging.WARNING)
 
 
 class TimeSeriesFeaturesModel(Model):
@@ -190,7 +195,9 @@ class TimeSeriesFeaturesEstimator(Estimator):
     
     def _fit(self, df):
         """Generate time-series aggregations and fit Prophet models"""
-        print("Generating time-series features...")
+        start_time = datetime.now()
+        timestamp = start_time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] Generating time-series features...")
         
         # Prepare date column
         df_prep = df.withColumn(
@@ -364,7 +371,10 @@ class TimeSeriesFeaturesEstimator(Estimator):
                     airport_features = pd.concat(airport_features_list, ignore_index=True)
                     print(f"    ✓ Generated airport Prophet features for {airport_features['origin'].nunique()} airports")
         
-        print("✓ Time-series feature generation complete!")
+        end_time = datetime.now()
+        duration = end_time - start_time
+        timestamp = end_time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] ✓ Time-series feature generation complete! (took {duration})")
         
         # Return a Model instance
         return TimeSeriesFeaturesModel(

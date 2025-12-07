@@ -9,6 +9,7 @@ from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.functions import col
 from pyspark.ml.base import Estimator, Model
 from graphframes import GraphFrame
+from datetime import datetime
 
 
 class GraphFeaturesModel(Model):
@@ -130,6 +131,10 @@ class GraphFeaturesEstimator(Estimator):
     
     def _fit(self, df):
         """Build graph from training data and compute PageRank scores"""
+        start_time = datetime.now()
+        timestamp = start_time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] Generating graph features...")
+        
         # Set checkpoint directory
         sc = self._spark.sparkContext
         sc.setCheckpointDir(self.checkpoint_dir)
@@ -165,6 +170,11 @@ class GraphFeaturesEstimator(Estimator):
         )
         
         pagerank_scores = pr_unw.join(pr_w, "airport", "outer")
+        
+        end_time = datetime.now()
+        duration = end_time - start_time
+        timestamp = end_time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] ✓ Graph feature generation complete! (took {duration})")
         
         # Return a Model instance
         return GraphFeaturesModel(
