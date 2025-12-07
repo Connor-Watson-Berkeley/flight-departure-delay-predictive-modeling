@@ -25,11 +25,11 @@ from pyspark.sql.functions import (
 from pyspark.sql.window import Window
 
 # Import flight lineage module
-# Note: flight_lineage.py is in notebooks/Feature Engineering/
-# In Databricks, use: %run /Workspace/path/to/notebooks/Feature Engineering/flight_lineage
+# Note: flight_lineage_features.py is in notebooks/Feature Engineering/
+# In Databricks, use: %run /Workspace/path/to/notebooks/Feature Engineering/flight_lineage_features
 # Or add to Python path before importing
 try:
-    from flight_lineage import add_flight_lineage_features
+    from flight_lineage_features import add_flight_lineage_features
 except ImportError:
     import sys
     import os
@@ -37,7 +37,7 @@ except ImportError:
     fe_path = os.path.join(os.path.dirname(__file__), '..', 'notebooks', 'Feature Engineering')
     if fe_path not in sys.path:
         sys.path.insert(0, fe_path)
-    from flight_lineage import add_flight_lineage_features
+    from flight_lineage_features import add_flight_lineage_features
 
 
 # ============================================================================
