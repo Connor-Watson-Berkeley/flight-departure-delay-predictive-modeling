@@ -21,9 +21,10 @@ Usage:
 """
 
 from pyspark.sql.functions import (
-    col, F, when, lit, coalesce, lag, row_number, sum as spark_sum, avg, max,
+    col, when, lit, coalesce, lag, row_number, sum as spark_sum, avg, max,
     array, array_remove, lpad, concat, floor, expr
 )
+import pyspark.sql.functions as F
 from pyspark.sql.window import Window
 
 
