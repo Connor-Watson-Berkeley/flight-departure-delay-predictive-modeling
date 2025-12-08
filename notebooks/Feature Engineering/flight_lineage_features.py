@@ -55,6 +55,12 @@ def add_flight_lineage_features(df):
         - lineage_rank: Rank of flight in aircraft's sequence
         - prev_flight_*: Previous flight attributes
         - lineage_*: Engineered lineage features
+        - lineage_rotation_time_minutes: Rotation time (prev_dep → curr_sched_dep, entire sequence)
+          Rotation Time = Air Time + Turnover Time (aviation terminology)
+        - Note: Turnover time features already exist (lineage_turnover_time_minutes, lineage_actual_turnover_time_minutes)
+        - required_time_prev_flight_minutes: Expected air_time + expected_turnover_time (convenience feature)
+        - impossible_on_time_flag: Boolean flag when required_time > available_time
+        - safe_*: Safe versions of features with intelligent data leakage imputation
         - columns_with_data_leakage: Array of columns with data leakage
         - prediction_cutoff_timestamp: Cutoff timestamp for data leakage detection
     
@@ -124,6 +130,11 @@ def add_flight_lineage_features(df):
     df = _compute_cumulative_features(df, tail_num_col)
     print("✓ Cumulative features computed")
     
+    # Step 7.5: Compute Rotation Time (Previous Departure to Current Scheduled Departure)
+    print("\nStep 7.5: Computing rotation time (prev_dep → curr_sched_dep)...")
+    df = _compute_time_between_prev_dep_and_sched_dep(df)
+    print("✓ Rotation time computed")
+    
     # Step 8: Jump Detection
     print("\nStep 8: Detecting jumps (aircraft repositioning)...")
     df = df.withColumn(
@@ -139,6 +150,16 @@ def add_flight_lineage_features(df):
     df = _check_data_leakage(df)
     print("✓ Data leakage checks complete")
     
+    # Step 9.5: Compute Safe Features (Intelligent Data Leakage Imputation)
+    print("\nStep 9.5: Computing safe features with intelligent data leakage imputation...")
+    df = _compute_safe_features(df)
+    print("✓ Safe features computed")
+    
+    # Step 9.6: Compute Required Time Features (for Model Learning)
+    print("\nStep 9.6: Computing required time features (expected_air_time + expected_turnover_time)...")
+    df = _compute_required_time_features(df)
+    print("✓ Required time features computed")
+    
     # Step 10: Apply Imputation for NULL Values (First Flight Handling)
     print("\nStep 10: Applying imputation for NULL values (first flight handling)...")
     df = _apply_imputation(df)
@@ -151,7 +172,13 @@ def add_flight_lineage_features(df):
     print("\n" + "=" * 60)
     print("✓ FLIGHT LINEAGE JOIN COMPLETE")
     print("=" * 60)
-    print(f"\nNew columns added: ~38 lineage features")
+    print(f"\nNew columns added: ~42+ lineage features")
+    print(f"  - lineage_rotation_time_minutes (prev_dep → curr_sched_dep, entire sequence)")
+    print(f"    Rotation Time = Air Time + Turnover Time (aviation terminology)")
+    print(f"  - turnover_time features: lineage_turnover_time_minutes, lineage_actual_turnover_time_minutes")
+    print(f"  - required_time_prev_flight_minutes (expected_air_time + expected_turnover_time)")
+    print(f"  - impossible_on_time_flag (and safe variant) - binary indicator when required_time > rotation_time")
+    print(f"  Note: Model will learn: departure_delay ≈ max(0, required_time - rotation_time)")
     print(f"All flights preserved - no rows dropped")
     print(f"[{timestamp}] ✓ Flight lineage feature generation complete! (took {duration})")
     print("=" * 60)
@@ -311,6 +338,203 @@ def _compute_cumulative_features(df, tail_num_col):
     df = df.withColumn('lineage_num_previous_flights', F.count('*').over(window_spec_cumulative))
     df = df.withColumn('lineage_avg_delay_previous_flights', F.avg('dep_delay').over(window_spec_cumulative))
     df = df.withColumn('lineage_max_delay_previous_flights', F.max('dep_delay').over(window_spec_cumulative))
+    
+    return df
+
+
+def _compute_time_between_prev_dep_and_sched_dep(df):
+    """
+    Compute rotation time: time between previous actual departure and current scheduled departure.
+    
+    Rotation Time = time from previous departure to current departure
+    This captures the entire sequence: prev_dep → flight → arrival → turnover → sched_dep
+    
+    Aviation Terminology:
+    - Air Time: Time in the air (flight time)
+    - Turnover Time: Time from arrival to next departure (ground time)
+    - Rotation Time: Time from one departure to the next departure (entire sequence)
+    
+    Rotation Time = Air Time + Turnover Time
+    
+    This is a key component in the departure time calculation model:
+    departure_time = previous_departure_time + rotation_time
+    where rotation_time = air_time + turnover_time
+    
+    Note: We already have turnover time features (lineage_turnover_time_minutes, 
+    lineage_actual_turnover_time_minutes) which measure prev_arr → curr_dep, so we don't
+    need a separate prev_arr → sched_dep feature (it would be redundant with turnover time).
+    
+    Note: Safe version (with data leakage handling) is computed in _compute_safe_features()
+    after data leakage flags are set.
+    """
+    # Convert previous actual departure time to minutes (if not already done)
+    if 'prev_flight_actual_dep_time_minutes' not in df.columns:
+        df = df.withColumn(
+            'prev_flight_actual_dep_time_minutes',
+            F.when(
+                col('prev_flight_actual_dep_time').isNotNull(),
+                (F.floor(col('prev_flight_actual_dep_time') / 100) * 60 + (col('prev_flight_actual_dep_time') % 100))
+            ).otherwise(None)
+        )
+    
+    # Compute rotation time: scheduled_dep_time - prev_actual_dep_time
+    # Rotation time = time from previous departure to current scheduled departure
+    # Handle day rollover (if scheduled is earlier in day than previous departure, assume next day)
+    df = df.withColumn(
+        'lineage_rotation_time_minutes',
+        F.when(
+            (col('prev_flight_actual_dep_time_minutes').isNotNull()) & 
+            (col('crs_dep_time_minutes').isNotNull()),
+            F.when(
+                col('crs_dep_time_minutes') >= col('prev_flight_actual_dep_time_minutes'),
+                col('crs_dep_time_minutes') - col('prev_flight_actual_dep_time_minutes')
+            ).otherwise(col('crs_dep_time_minutes') + 1440 - col('prev_flight_actual_dep_time_minutes'))
+        ).otherwise(None)
+    )
+    
+    return df
+
+
+def _compute_safe_features(df):
+    """
+    Compute safe_ prefixed features that intelligently handle data leakage.
+    
+    For features with data leakage, we use intelligent imputation:
+    - If previous departure has leakage: use min(prediction_cutoff_timestamp, scheduled_departure_time)
+    - Logic: If flight is late, we know the *soonest* it can depart is right now (cutoff),
+      OR it will depart at scheduled time if that's in the future
+    """
+    # Convert scheduled departure to timestamp for comparison
+    df = df.withColumn(
+        'sched_dep_timestamp',
+        F.when(
+            col('sched_depart_date_time').isNotNull(),
+            col('sched_depart_date_time')
+        ).otherwise(
+            F.when(
+                col('fl_date').isNotNull() & col('crs_dep_time').isNotNull(),
+                F.to_timestamp(
+                    F.concat(col('fl_date'), F.lpad(col('crs_dep_time').cast('string'), 4, '0')),
+                    'yyyy-MM-ddHHmm'
+                )
+            )
+        )
+    )
+    
+    # Create safe previous departure timestamp: use cutoff if leakage, otherwise use actual
+    df = df.withColumn(
+        'safe_prev_flight_dep_timestamp',
+        F.when(
+            col('has_leakage_prev_flight_actual_dep_time'),
+            # Data leakage: use min(cutoff, scheduled departure)
+            F.when(
+                (col('prediction_cutoff_timestamp').isNotNull()) & (col('sched_dep_timestamp').isNotNull()),
+                F.when(
+                    col('prediction_cutoff_timestamp') < col('sched_dep_timestamp'),
+                    col('prediction_cutoff_timestamp')
+                ).otherwise(col('sched_dep_timestamp'))
+            ).otherwise(col('sched_dep_timestamp'))
+        ).otherwise(
+            # No leakage: use actual departure timestamp
+            F.when(
+                (col('prev_flight_actual_dep_time').isNotNull()) & (col('prev_flight_fl_date').isNotNull()),
+                F.to_timestamp(
+                    F.concat(col('prev_flight_fl_date'), F.lpad(col('prev_flight_actual_dep_time').cast('string'), 4, '0')),
+                    'yyyy-MM-ddHHmm'
+                )
+            )
+        )
+    )
+    
+    # Convert safe timestamp back to minutes for comparison with scheduled departure
+    df = df.withColumn(
+        'safe_prev_flight_dep_time_minutes',
+        F.when(
+            col('safe_prev_flight_dep_timestamp').isNotNull(),
+            F.hour(col('safe_prev_flight_dep_timestamp')) * 60 + F.minute(col('safe_prev_flight_dep_timestamp'))
+        ).otherwise(None)
+    )
+    
+    # Compute safe rotation time using the safe previous departure time
+    df = df.withColumn(
+        'safe_lineage_rotation_time_minutes',
+        F.when(
+            (col('safe_prev_flight_dep_time_minutes').isNotNull()) & 
+            (col('crs_dep_time_minutes').isNotNull()),
+            F.when(
+                col('crs_dep_time_minutes') >= col('safe_prev_flight_dep_time_minutes'),
+                col('crs_dep_time_minutes') - col('safe_prev_flight_dep_time_minutes')
+            ).otherwise(col('crs_dep_time_minutes') + 1440 - col('safe_prev_flight_dep_time_minutes'))
+        ).otherwise(
+            # Fallback to regular version if safe version unavailable
+            col('lineage_rotation_time_minutes')
+        )
+    )
+    
+    return df
+
+
+def _compute_required_time_features(df):
+    """
+    Compute required time for previous flight completion (expected_air_time + expected_turnover_time).
+    
+    This is a convenience feature that combines expected air time and expected turnover time.
+    The model will learn the relationship:
+    
+    departure_delay ≈ max(0, required_time_prev_flight_minutes - lineage_rotation_time_minutes)
+    
+    Or equivalently, the model will learn:
+    departure_delay ≈ max(0, -time_buffer) where:
+    time_buffer = lineage_rotation_time_minutes - required_time_prev_flight_minutes
+    
+    Note: We don't compute time_buffer_minutes explicitly as it's a linear combination the model can learn.
+    However, we compute required_time as a convenience feature to make the relationship clearer.
+    
+    Uses conditional expected values if available, otherwise falls back to scheduled times.
+    """
+    # Try to use conditional expected values if available (from ConditionalExpectedValuesEstimator)
+    # Otherwise, fall back to scheduled/actual values
+    
+    # Determine which expected air time to use (prefer conditional, fallback to scheduled)
+    expected_air_time_col = F.coalesce(
+        col('expected_air_time_route_temporal_minutes'),  # Temporal conditional (best)
+        col('expected_air_time_route_minutes'),           # Route-based conditional
+        col('expected_air_time_aircraft_minutes'),        # Aircraft-based conditional
+        col('crs_elapsed_time')                           # Fallback to scheduled
+    )
+    
+    # Determine which expected turnover time to use (prefer conditional, fallback to scheduled)
+    expected_turnover_time_col = F.coalesce(
+        col('expected_turnover_time_temporal_minutes'),           # Temporal conditional (best)
+        col('expected_turnover_time_carrier_airport_minutes'),    # Carrier-airport conditional
+        col('expected_turnover_time_aircraft_minutes'),           # Aircraft-based conditional
+        col('lineage_turnover_time_minutes')                      # Fallback to scheduled turnover
+    )
+    
+    # Compute required time (flight time + turnover time)
+    # This is a convenience feature - the model can also compute this from the components
+    df = df.withColumn(
+        'required_time_prev_flight_minutes',
+        expected_air_time_col + expected_turnover_time_col
+    )
+    
+    # Safe version uses the same expected values (expected values are safe, computed from historical data)
+    df = df.withColumn(
+        'safe_required_time_prev_flight_minutes',
+        expected_air_time_col + expected_turnover_time_col
+    )
+    
+    # Flag impossible on-time scenarios: when required_time > available rotation_time
+    # This is a non-linear binary indicator that might be useful for the model
+    df = df.withColumn(
+        'impossible_on_time_flag',
+        col('required_time_prev_flight_minutes') > col('lineage_rotation_time_minutes')
+    )
+    
+    df = df.withColumn(
+        'safe_impossible_on_time_flag',
+        col('safe_required_time_prev_flight_minutes') > col('safe_lineage_rotation_time_minutes')
+    )
     
     return df
 
@@ -509,6 +733,14 @@ def _check_data_leakage(df):
     df = df.withColumn('has_leakage_lineage_avg_delay_previous_flights', col('has_leakage_prev_flight_dep_delay'))
     df = df.withColumn('has_leakage_lineage_max_delay_previous_flights', col('has_leakage_prev_flight_dep_delay'))
     
+    # Rotation time inherits leakage from previous departure
+    df = df.withColumn('has_leakage_lineage_rotation_time_minutes', col('has_leakage_prev_flight_actual_dep_time'))
+    
+    # Required time features: Expected values are safe (computed from historical data)
+    # But impossible_on_time_flag depends on time_between, so it inherits leakage
+    df = df.withColumn('has_leakage_required_time_prev_flight_minutes', F.lit(False))  # Expected values are safe
+    df = df.withColumn('has_leakage_impossible_on_time_flag', col('has_leakage_time_between_prev_dep_and_sched_dep_minutes'))
+    
     # ============================================================================
     # STEP 6: Create array column listing all columns with data leakage
     # ============================================================================
@@ -535,7 +767,9 @@ def _check_data_leakage(df):
                 F.when(col('has_leakage_lineage_actual_turn_time_minutes'), F.lit('lineage_actual_turn_time_minutes')).otherwise(None),
                 F.when(col('has_leakage_lineage_cumulative_delay'), F.lit('lineage_cumulative_delay')).otherwise(None),
                 F.when(col('has_leakage_lineage_avg_delay_previous_flights'), F.lit('lineage_avg_delay_previous_flights')).otherwise(None),
-                F.when(col('has_leakage_lineage_max_delay_previous_flights'), F.lit('lineage_max_delay_previous_flights')).otherwise(None)
+                F.when(col('has_leakage_lineage_max_delay_previous_flights'), F.lit('lineage_max_delay_previous_flights')).otherwise(None),
+                F.when(col('has_leakage_lineage_rotation_time_minutes'), F.lit('lineage_rotation_time_minutes')).otherwise(None),
+                F.when(col('has_leakage_impossible_on_time_flag'), F.lit('impossible_on_time_flag')).otherwise(None)
             ]),
             None
         )
@@ -626,6 +860,23 @@ def _apply_imputation(df):
     df = df.withColumn('lineage_max_delay_previous_flights', F.coalesce(col('lineage_max_delay_previous_flights'), F.lit(-10.0)))
     df = df.withColumn('lineage_num_previous_flights', F.coalesce(col('lineage_num_previous_flights'), F.lit(0)))
     df = df.withColumn('lineage_expected_flight_time_minutes', F.coalesce(col('lineage_expected_flight_time_minutes'), col('crs_elapsed_time')))
+    
+    # Impute rotation time features (if previous flight unavailable, use scheduled departure as baseline)
+    df = df.withColumn('lineage_rotation_time_minutes', 
+                       F.coalesce(col('lineage_rotation_time_minutes'), F.lit(0.0)))
+    df = df.withColumn('safe_lineage_rotation_time_minutes',
+                       F.coalesce(col('safe_lineage_rotation_time_minutes'), 
+                                  col('lineage_rotation_time_minutes'), F.lit(0.0)))
+    
+    # Impute required time features
+    df = df.withColumn('required_time_prev_flight_minutes',
+                       F.coalesce(col('required_time_prev_flight_minutes'), col('crs_elapsed_time'), F.lit(120.0)))
+    df = df.withColumn('safe_required_time_prev_flight_minutes',
+                       F.coalesce(col('safe_required_time_prev_flight_minutes'), col('required_time_prev_flight_minutes')))
+    df = df.withColumn('impossible_on_time_flag',
+                       F.coalesce(col('impossible_on_time_flag'), F.lit(False)))
+    df = df.withColumn('safe_impossible_on_time_flag',
+                       F.coalesce(col('safe_impossible_on_time_flag'), col('impossible_on_time_flag')))
     
     df = df.drop('prev_flight_crs_dep_time_minutes')
     
