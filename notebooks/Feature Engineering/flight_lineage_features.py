@@ -14,6 +14,10 @@ Key Features Added:
 CRITICAL: NO ROWS ARE DROPPED - All flights are preserved. Flights without previous
 flight data get NULL values which are handled via imputation.
 
+IMPORTANT: When adding new NUMERIC features to this module, they must also be added
+to the `numerical_features` list in `notebooks/Cross Validator/cv.py` to ensure
+proper type casting during data loading. See cv.py FlightDelayDataLoader class.
+
 Usage:
     from flight_lineage import add_flight_lineage_features
     
