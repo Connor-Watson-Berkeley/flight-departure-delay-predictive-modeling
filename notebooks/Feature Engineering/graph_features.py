@@ -6,7 +6,7 @@ Computes PageRank features (weighted and unweighted) from flight network graph.
 """
 
 from pyspark.sql import SparkSession, functions as F
-from pyspark.sql.functions import col, broadcast
+from pyspark.sql.functions import col
 from pyspark.ml.base import Estimator, Model
 from graphframes import GraphFrame
 from datetime import datetime
@@ -20,57 +20,34 @@ class GraphFeaturesModel(Model):
         self.pagerank_scores = pagerank_scores
         self.origin_col = origin_col
         self.dest_col = dest_col
-        # Pre-broadcast the pagerank_scores for efficient reuse across multiple transform calls
-        # This avoids creating a new broadcast variable on every transform() call
-        if pagerank_scores is not None:
-            self.pagerank_broadcast = broadcast(pagerank_scores)
-        else:
-            self.pagerank_broadcast = None
     
     def _transform(self, df):
         """Join PageRank scores to input DataFrame"""
-        if self.pagerank_broadcast is None:
+        if self.pagerank_scores is None:
             raise ValueError("Model must be fitted before transform()")
         
-        # Prepare pagerank lookup tables with renamed columns for origin and dest
-        # This allows us to do a single join instead of two sequential joins
-        origin_pagerank = (
-            self.pagerank_broadcast
-            .select(
-                col("airport").alias(f"{self.origin_col}_lookup"),
-                col("pagerank_weighted").alias("origin_pagerank_weighted"),
-                col("pagerank_unweighted").alias("origin_pagerank_unweighted")
-            )
-        )
-        
-        dest_pagerank = (
-            self.pagerank_broadcast
-            .select(
-                col("airport").alias(f"{self.dest_col}_lookup"),
-                col("pagerank_weighted").alias("dest_pagerank_weighted"),
-                col("pagerank_unweighted").alias("dest_pagerank_unweighted")
-            )
-        )
-        
-        # Join both origin and dest PageRank scores in a single pass
-        # Using left joins to preserve all rows even if airport not in pagerank_scores
+        # Join PageRank scores for origin and destination airports
         df_with_features = (
             df
             .join(
-                origin_pagerank,
-                col(self.origin_col) == col(f"{self.origin_col}_lookup"),
+                self.pagerank_scores,
+                col(self.origin_col) == col("airport"),
                 "left"
             )
-            .drop(f"{self.origin_col}_lookup")
+            .withColumnRenamed("pagerank_weighted", "origin_pagerank_weighted")
+            .withColumnRenamed("pagerank_unweighted", "origin_pagerank_unweighted")
+            .drop("airport")
             .join(
-                dest_pagerank,
-                col(self.dest_col) == col(f"{self.dest_col}_lookup"),
+                self.pagerank_scores,
+                col(self.dest_col) == col("airport"),
                 "left"
             )
-            .drop(f"{self.dest_col}_lookup")
+            .withColumnRenamed("pagerank_weighted", "dest_pagerank_weighted")
+            .withColumnRenamed("pagerank_unweighted", "dest_pagerank_unweighted")
+            .drop("airport")
         )
         
-        # Fill NULL PageRank values with 0 (for airports not in training graph) in a single pass
+        # Fill NULL PageRank values with 0 (for airports not in training graph)
         # TODO: Consider better imputation strategy. Isolated nodes in PageRank still receive
         #       PageRank from teleportation (reset probability). A new airport not in the training
         #       graph would theoretically have some PageRank if it were added as an isolated node.
@@ -83,9 +60,8 @@ class GraphFeaturesModel(Model):
             "dest_pagerank_weighted",
             "dest_pagerank_unweighted"
         ]
-        # Use a single fillna call with a dictionary instead of a loop
-        fill_dict = {col_name: 0.0 for col_name in pagerank_cols}
-        df_with_features = df_with_features.fillna(fill_dict)
+        for col_name in pagerank_cols:
+            df_with_features = df_with_features.fillna({col_name: 0.0})
         
         return df_with_features
 
@@ -209,3 +185,4 @@ class GraphFeaturesEstimator(Estimator):
             origin_col=self.origin_col,
             dest_col=self.dest_col
         )
+

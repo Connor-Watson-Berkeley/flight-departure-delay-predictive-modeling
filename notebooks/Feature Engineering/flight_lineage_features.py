@@ -180,7 +180,8 @@ def add_flight_lineage_features(df):
     print(f"  Turnover Time Features:")
     print(f"    - scheduled_lineage_turnover_time_minutes: Scheduled turnover time (prev_crs_arr → curr_crs_dep)")
     print(f"  Air Time Features:")
-    print(f"    - prev_flight_crs_elapsed_time: Scheduled air time for previous flight")
+    print(f"    - prev_flight_scheduled_flight_time_minutes: Scheduled flight time for previous flight (arr - dep)")
+    print(f"    - prev_flight_crs_elapsed_time: Scheduled air time for previous flight (from raw data, for backward compatibility)")
     print(f"    - crs_elapsed_time: Scheduled air time for current flight")
     print(f"  Required Time Features:")
     print(f"    - required_time_prev_flight_minutes: Expected air_time + expected_turnover_time")
@@ -331,6 +332,20 @@ def _compute_cumulative_features(df, tail_num_col):
         ).otherwise(None)
     )
     
+    # Compute scheduled flight time for previous flight (prev flight's scheduled arrival - scheduled departure)
+    # This represents how long the previous flight was scheduled to be in the air
+    # Used for hypothesis: when rotation_time >> scheduled_flight_time, we have more buffer = likely to depart on time
+    df = df.withColumn(
+        'prev_flight_scheduled_flight_time_minutes',
+        F.when(
+            (col('prev_flight_crs_arr_time_minutes').isNotNull()) & (col('prev_flight_crs_dep_time_minutes').isNotNull()),
+            F.when(
+                col('prev_flight_crs_arr_time_minutes') >= col('prev_flight_crs_dep_time_minutes'),
+                col('prev_flight_crs_arr_time_minutes') - col('prev_flight_crs_dep_time_minutes')
+            ).otherwise(col('prev_flight_crs_arr_time_minutes') + 1440 - col('prev_flight_crs_dep_time_minutes'))
+        ).otherwise(None)
+    )
+    
     # Compute scheduled rotation time (time between prev flight's scheduled departure and current flight's scheduled departure)
     # This is the scheduled version of rotation_time: prev_crs_dep → curr_crs_dep (entire scheduled sequence)
     df = df.withColumn(
@@ -433,12 +448,20 @@ def _compute_safe_features(df):
     """
     Compute safe_ prefixed features that intelligently handle data leakage.
     
-    For features with data leakage, we use intelligent imputation:
-    - If previous departure has leakage: use min(prediction_cutoff_timestamp, scheduled_departure_time)
-    - Logic: If flight is late, we know the *soonest* it can depart is right now (cutoff),
-      OR it will depart at scheduled time if that's in the future
+    For rotation time, we compute "time from last departure to next departure":
+    (1) If previous flight already departed (actual_dep_time <= prediction_cutoff): use actual_dep_time
+    (2) If previous flight hasn't departed yet (actual_dep_time > prediction_cutoff):
+       - If scheduled_dep_time >= prediction_cutoff (scheduled is in future): use scheduled_dep_time
+       - If scheduled_dep_time < prediction_cutoff (scheduled is in past): use "right now" (prediction_cutoff)
+    
+    Logic: At prediction time (2 hours before scheduled departure = prediction_cutoff), we know:
+    - If previous flight already departed (actual_dep_time <= prediction_cutoff): use that actual time
+    - If previous flight hasn't departed yet (actual_dep_time > prediction_cutoff):
+       - This means actual_dep_time > (next_departure - 2 hours)
+       - Use scheduled time if it's in the future (>= cutoff)
+       - Use "right now" (cutoff) if scheduled is in the past (< cutoff)
     """
-    # Convert scheduled departure to timestamp for comparison
+    # Convert scheduled departure to timestamp for comparison (CURRENT flight's scheduled departure)
     df = df.withColumn(
         'sched_dep_timestamp',
         F.when(
@@ -455,28 +478,41 @@ def _compute_safe_features(df):
         )
     )
     
-    # Create safe previous departure timestamp: use cutoff if leakage, otherwise use actual
+    # Convert previous flight's scheduled departure to timestamp for comparison
+    df = df.withColumn(
+        'prev_flight_sched_dep_timestamp',
+        F.when(
+            (col('prev_flight_crs_dep_time').isNotNull()) & (col('prev_flight_fl_date').isNotNull()),
+            F.to_timestamp(
+                F.concat(col('prev_flight_fl_date'), F.lpad(col('prev_flight_crs_dep_time').cast('string'), 4, '0')),
+                'yyyy-MM-ddHHmm'
+            )
+        ).otherwise(None)
+    )
+    
+    # Create safe previous departure timestamp
     df = df.withColumn(
         'safe_prev_flight_dep_timestamp',
         F.when(
-            col('has_leakage_prev_flight_actual_dep_time'),
-            # Data leakage: use min(cutoff, scheduled departure)
-            F.when(
-                (col('prediction_cutoff_timestamp').isNotNull()) & (col('sched_dep_timestamp').isNotNull()),
-                F.when(
-                    col('prediction_cutoff_timestamp') < col('sched_dep_timestamp'),
-                    col('prediction_cutoff_timestamp')
-                ).otherwise(col('sched_dep_timestamp'))
-            ).otherwise(col('sched_dep_timestamp'))
-        ).otherwise(
-            # No leakage: use actual departure timestamp
-            F.when(
-                (col('prev_flight_actual_dep_time').isNotNull()) & (col('prev_flight_fl_date').isNotNull()),
-                F.to_timestamp(
-                    F.concat(col('prev_flight_fl_date'), F.lpad(col('prev_flight_actual_dep_time').cast('string'), 4, '0')),
-                    'yyyy-MM-ddHHmm'
-                )
+            # Case 1: Previous flight already departed (actual_dep_time <= prediction_cutoff) - use actual departure time
+            (col('prev_flight_actual_dep_time').isNotNull()) & 
+            (col('prev_flight_fl_date').isNotNull()) & 
+            (~col('has_leakage_prev_flight_actual_dep_time')),  # No leakage = already departed (actual_dep_time <= cutoff)
+            F.to_timestamp(
+                F.concat(col('prev_flight_fl_date'), F.lpad(col('prev_flight_actual_dep_time').cast('string'), 4, '0')),
+                'yyyy-MM-ddHHmm'
             )
+        ).otherwise(
+            # Case 2: Previous flight hasn't departed yet (actual_dep_time > prediction_cutoff)
+            # This means: at prediction time (2 hours before next departure), we know the previous flight
+            # hasn't departed yet, so we use scheduled if in future, or "right now" (cutoff) if in past
+            F.when(
+                (col('prediction_cutoff_timestamp').isNotNull()) & (col('prev_flight_sched_dep_timestamp').isNotNull()),
+                F.when(
+                    col('prev_flight_sched_dep_timestamp') >= col('prediction_cutoff_timestamp'),
+                    col('prev_flight_sched_dep_timestamp')  # Scheduled is in future, use scheduled
+                ).otherwise(col('prediction_cutoff_timestamp'))  # Scheduled is in past, use "right now" (cutoff)
+            ).otherwise(col('prev_flight_sched_dep_timestamp'))
         )
     )
     
@@ -876,7 +912,14 @@ def _check_data_leakage(df):
 
 
 def _apply_imputation(df):
-    """Apply imputation for NULL values (first flight handling)."""
+    """
+    Apply imputation for NULL values (first flight handling).
+    
+    KEY IMPUTATION LOGIC:
+    - NULL rotation_time = no previous flight = plane already at airport
+    - Large rotation_time buffer = plane is already at airport, plenty of time = likely to leave on time
+    - Impute to 1440 minutes (24 hours) to indicate "essentially unlimited buffer" for first flights
+    """
     # Calculate scheduled times backwards from current scheduled departure - 4 hours
     df = df.withColumn(
         'prev_flight_crs_dep_time_minutes',
@@ -915,7 +958,35 @@ def _apply_imputation(df):
     
     # Impute all NULL values
     df = df.withColumn('prev_flight_crs_arr_time', F.coalesce(col('prev_flight_crs_arr_time'), col('prev_flight_crs_dep_time')))
-    df = df.withColumn('prev_flight_crs_elapsed_time', F.coalesce(col('prev_flight_crs_elapsed_time'), col('crs_elapsed_time')))
+    
+    # Scheduled flight time for previous flight: impute to 0 for first flights or jumps
+    # This is computed as prev_flight_crs_arr_time - prev_flight_crs_dep_time (in _compute_cumulative_features)
+    # If rotation_time >> scheduled_flight_time, then we have more buffer and are more likely to depart on time
+    df = df.withColumn(
+        'prev_flight_scheduled_flight_time_minutes',
+        F.when(
+            (col('lineage_rank') == 1) | col('lineage_is_jump'),
+            F.lit(0.0)  # First flight or jump: no previous scheduled flight time
+        ).otherwise(
+            F.coalesce(col('prev_flight_scheduled_flight_time_minutes'), F.lit(0.0))
+        )
+    )
+    
+    # Keep prev_flight_crs_elapsed_time for backward compatibility (it's used in fallback logic)
+    # But prefer the explicitly computed prev_flight_scheduled_flight_time_minutes
+    df = df.withColumn(
+        'prev_flight_crs_elapsed_time',
+        F.when(
+            (col('lineage_rank') == 1) | col('lineage_is_jump'),
+            F.lit(0.0)  # First flight or jump: no previous scheduled flight time
+        ).otherwise(
+            F.coalesce(
+                col('prev_flight_scheduled_flight_time_minutes'),  # Use explicitly computed value if available
+                col('prev_flight_crs_elapsed_time'),  # Otherwise fall back to raw crs_elapsed_time
+                F.lit(0.0)
+            )
+        )
+    )
     df = df.withColumn('prev_flight_dep_delay', F.coalesce(col('prev_flight_dep_delay'), F.lit(-10.0)))
     df = df.withColumn('prev_flight_arr_delay', F.coalesce(col('prev_flight_arr_delay'), F.lit(-10.0)))
     df = df.withColumn('prev_flight_actual_dep_time', F.coalesce(col('prev_flight_actual_dep_time'), col('prev_flight_crs_dep_time')))
@@ -935,9 +1006,12 @@ def _apply_imputation(df):
     df = df.withColumn('prev_flight_op_carrier', F.coalesce(col('prev_flight_op_carrier'), col('op_carrier')))
     df = df.withColumn('prev_flight_op_carrier_fl_num', F.coalesce(col('prev_flight_op_carrier_fl_num'), col('op_carrier_fl_num')))
     
-    # Impute engineered lineage features
-    df = df.withColumn('scheduled_lineage_turnover_time_minutes', F.coalesce(col('scheduled_lineage_turnover_time_minutes'), F.lit(240.0)))
-    df = df.withColumn('lineage_actual_turnover_time_minutes', F.coalesce(col('lineage_actual_turnover_time_minutes'), F.lit(240.0)))
+    # Impute turnover time features (if previous flight unavailable, plane is already at airport)
+    # NULL turnover time = no previous flight = plane already at airport = large buffer = likely to leave on time
+    # Impute to a very large value (1440 minutes = 24 hours) to indicate "essentially unlimited buffer"
+    LARGE_TURNOVER_TIME_MINUTES = 1440.0  # 24 hours - indicates plane already at airport, plenty of buffer
+    df = df.withColumn('scheduled_lineage_turnover_time_minutes', F.coalesce(col('scheduled_lineage_turnover_time_minutes'), F.lit(LARGE_TURNOVER_TIME_MINUTES)))
+    df = df.withColumn('lineage_actual_turnover_time_minutes', F.coalesce(col('lineage_actual_turnover_time_minutes'), F.lit(LARGE_TURNOVER_TIME_MINUTES)))
     df = df.withColumn('lineage_actual_taxi_time_minutes', F.coalesce(col('lineage_actual_taxi_time_minutes'), col('lineage_actual_turnover_time_minutes')))
     df = df.withColumn('lineage_actual_turn_time_minutes', F.coalesce(col('lineage_actual_turn_time_minutes'), col('lineage_actual_turnover_time_minutes')))
     df = df.withColumn('lineage_cumulative_delay', F.coalesce(col('lineage_cumulative_delay'), F.lit(0.0)))
@@ -946,14 +1020,17 @@ def _apply_imputation(df):
     df = df.withColumn('lineage_num_previous_flights', F.coalesce(col('lineage_num_previous_flights'), F.lit(0)))
     df = df.withColumn('lineage_expected_flight_time_minutes', F.coalesce(col('lineage_expected_flight_time_minutes'), col('crs_elapsed_time')))
     
-    # Impute rotation time features (if previous flight unavailable, use scheduled departure as baseline)
+    # Impute rotation time features (if previous flight unavailable, plane is already at airport)
+    # NULL rotation time = no previous flight = plane already at airport = large buffer = likely to leave on time
+    # Impute to a very large value (1440 minutes = 24 hours) to indicate "essentially unlimited buffer"
+    LARGE_ROTATION_TIME_MINUTES = 1440.0  # 24 hours - indicates plane already at airport, plenty of buffer
     df = df.withColumn('lineage_rotation_time_minutes', 
-                       F.coalesce(col('lineage_rotation_time_minutes'), F.lit(0.0)))
+                       F.coalesce(col('lineage_rotation_time_minutes'), F.lit(LARGE_ROTATION_TIME_MINUTES)))
     df = df.withColumn('scheduled_lineage_rotation_time_minutes',
-                       F.coalesce(col('scheduled_lineage_rotation_time_minutes'), F.lit(0.0)))
+                       F.coalesce(col('scheduled_lineage_rotation_time_minutes'), F.lit(LARGE_ROTATION_TIME_MINUTES)))
     df = df.withColumn('safe_lineage_rotation_time_minutes',
                        F.coalesce(col('safe_lineage_rotation_time_minutes'), 
-                                  col('lineage_rotation_time_minutes'), F.lit(0.0)))
+                                  col('lineage_rotation_time_minutes'), F.lit(LARGE_ROTATION_TIME_MINUTES)))
     
     # Impute required time features
     df = df.withColumn('required_time_prev_flight_minutes',
