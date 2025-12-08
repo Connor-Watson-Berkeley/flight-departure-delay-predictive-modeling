@@ -7,7 +7,7 @@ temporal trends and seasonality.
 """
 
 from pyspark.sql import SparkSession, functions as F
-from pyspark.sql.functions import col, to_timestamp, when
+from pyspark.sql.functions import col, to_timestamp, when, broadcast
 from pyspark.ml.base import Estimator, Model
 import pandas as pd
 from datetime import datetime
@@ -64,8 +64,9 @@ class TimeSeriesFeaturesModel(Model):
                     [col(c) for c in global_feature_cols]
                 ).cache()  # Cache to avoid recomputation (materialized on first use)
             
+            # Broadcast the small lookup table for faster joins
             df_with_features = df_with_features.join(
-                self._global_spark_features,
+                broadcast(self._global_spark_features),
                 col(self.date_col) == col("global_date_str"),
                 "left"
             ).drop("global_date_str")  # Drop the join key after joining
@@ -84,8 +85,9 @@ class TimeSeriesFeaturesModel(Model):
                     [col(c) for c in carrier_feature_cols]
                 ).cache()  # Cache to avoid recomputation (materialized on first use)
             
+            # Broadcast the small lookup table for faster joins
             df_with_features = df_with_features.join(
-                self._carrier_spark_features,
+                broadcast(self._carrier_spark_features),
                 (col(self.carrier_col) == col("carrier_join_key")) & 
                 (col(self.date_col) == col("carrier_date_str")),
                 "left"
@@ -105,8 +107,9 @@ class TimeSeriesFeaturesModel(Model):
                     [col(c) for c in airport_feature_cols]
                 ).cache()  # Cache to avoid recomputation (materialized on first use)
             
+            # Broadcast the small lookup table for faster joins
             df_with_features = df_with_features.join(
-                self._airport_spark_features,
+                broadcast(self._airport_spark_features),
                 (col(self.origin_col) == col("airport_join_key")) & 
                 (col(self.date_col) == col("airport_date_str")),
                 "left"
@@ -127,10 +130,12 @@ class TimeSeriesFeaturesModel(Model):
             if col_name not in df_with_features.columns:
                 df_with_features = df_with_features.withColumn(col_name, F.lit(None).cast('double'))
         
-        # Fill NULL values with 0 for Prophet forecast columns
+        # Fill NULL values with 0 for Prophet forecast columns in a single pass
         prophet_cols = [c for c in df_with_features.columns if 'prophet' in c.lower()]
-        for col_name in prophet_cols:
-            df_with_features = df_with_features.fillna({col_name: 0.0})
+        if prophet_cols:
+            # Use a single fillna call with a dictionary instead of a loop
+            fill_dict = {col_name: 0.0 for col_name in prophet_cols}
+            df_with_features = df_with_features.fillna(fill_dict)
         
         return df_with_features
 
