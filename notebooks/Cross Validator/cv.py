@@ -44,7 +44,6 @@ class FlightDelayDataLoader:
     def __init__(self):
         self.folds = {}
         self.numerical_features = [
-            # Weather features
             'hourlyprecipitation',
             'hourlysealevelpressure',
             'hourlyaltimetersetting',
@@ -56,44 +55,41 @@ class FlightDelayDataLoader:
             'hourlydewpointtemperature',
             'hourlydrybulbtemperature',
             'hourlyvisibility',
-
-            # Flight Lineage Features from flight_lineage_features.py
             'crs_elapsed_time',
             'distance',
             'elevation',
-            # Flight Lineage Features from flight_lineage_features.py
-            # IMPORTANT: When new numeric features are added to flight_lineage_features.py,
-            # they must also be added to this list to ensure proper type casting.
-            # See flight_lineage_features.py for complete feature documentation.
-            'lineage_rank',  # Rank of flight in aircraft's sequence (integer)
-            # Previous flight delay features
-            'prev_flight_dep_delay',  # Previous flight departure delay (minutes)
-            'prev_flight_arr_delay',  # Previous flight arrival delay (minutes)
-            # Previous flight time features
-            'prev_flight_air_time',  # Previous flight air time (minutes)
-            'prev_flight_crs_elapsed_time',  # Previous flight scheduled elapsed time (minutes)
-            'prev_flight_taxi_in',  # Previous flight taxi-in time (minutes)
-            'prev_flight_taxi_out',  # Previous flight taxi-out time (minutes)
-            'prev_flight_actual_elapsed_time',  # Previous flight actual elapsed time (minutes)
-            # Previous flight route features
-            'prev_flight_distance',  # Previous flight distance (miles)
-            # Turnover time features (scheduled)
-            'lineage_turnover_time_minutes',  # Time between prev flight scheduled arrival and current scheduled departure (minutes)
-            'lineage_taxi_time_minutes',  # Alias for lineage_turnover_time_minutes
-            'lineage_turn_time_minutes',  # Alias for lineage_turnover_time_minutes
-            # Turnover time features (actual - may have data leakage)
-            'lineage_actual_turnover_time_minutes',  # Time between prev flight actual arrival and current actual departure (minutes)
-            'lineage_actual_taxi_time_minutes',  # Alias for lineage_actual_turnover_time_minutes
-            'lineage_actual_turn_time_minutes',  # Alias for lineage_actual_turnover_time_minutes
-            # Expected flight time
-            'lineage_expected_flight_time_minutes',  # Expected flight time: scheduled arrival - scheduled departure (minutes)
-            # Cumulative delay features (may have data leakage)
-            'lineage_cumulative_delay',  # Total delay accumulated by previous flights (minutes)
-            'lineage_num_previous_flights',  # Number of flights the aircraft has already completed
-            'lineage_avg_delay_previous_flights',  # Average delay across previous flights (minutes)
-            'lineage_max_delay_previous_flights',  # Maximum delay in previous flights (minutes)
-            # Data leakage detection
-            'prediction_cutoff_minutes',  # Scheduled departure time minus 2 hours (minutes since midnight)
+            
+            # Flight lineage features
+            'lineage_rank',
+            'prev_flight_dep_delay',
+            'prev_flight_arr_delay',
+            'prev_flight_air_time',
+            'prev_flight_crs_elapsed_time',
+            'prev_flight_taxi_in',
+            'prev_flight_taxi_out',
+            'prev_flight_actual_elapsed_time',
+            'prev_flight_distance',
+            # Scheduled time features (data leakage-free)
+            'scheduled_lineage_rotation_time_minutes',
+            'scheduled_lineage_turnover_time_minutes',
+            # Actual time features (may have data leakage)
+            'lineage_rotation_time_minutes',
+            'lineage_actual_turnover_time_minutes',
+            'lineage_actual_taxi_time_minutes',
+            'lineage_actual_turn_time_minutes',
+            # Safe features (intelligent data leakage handling)
+            'safe_lineage_rotation_time_minutes',
+            # Other lineage features
+            'lineage_expected_flight_time_minutes',
+            'lineage_cumulative_delay',
+            'lineage_num_previous_flights',
+            'lineage_avg_delay_previous_flights',
+            'lineage_max_delay_previous_flights',
+            # Required time features
+            'required_time_prev_flight_minutes',
+            'safe_required_time_prev_flight_minutes',
+            'impossible_on_time_flag',
+            'safe_impossible_on_time_flag',
         ]
 
     def _cast_numerics(self, df):

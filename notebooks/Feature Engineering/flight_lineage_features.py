@@ -57,7 +57,7 @@ def add_flight_lineage_features(df):
         - lineage_*: Engineered lineage features
         - lineage_rotation_time_minutes: Rotation time (prev_dep → curr_sched_dep, entire sequence)
           Rotation Time = Air Time + Turnover Time (aviation terminology)
-        - Note: Turnover time features already exist (lineage_turnover_time_minutes, lineage_actual_turnover_time_minutes)
+        - Note: Turnover time features already exist (scheduled_lineage_turnover_time_minutes, lineage_actual_turnover_time_minutes)
         - required_time_prev_flight_minutes: Expected air_time + expected_turnover_time (convenience feature)
         - impossible_on_time_flag: Boolean flag when required_time > available_time
         - safe_*: Safe versions of features with intelligent data leakage imputation
@@ -173,13 +173,29 @@ def add_flight_lineage_features(df):
     print("✓ FLIGHT LINEAGE JOIN COMPLETE")
     print("=" * 60)
     print(f"\nNew columns added: ~42+ lineage features")
-    print(f"  - lineage_rotation_time_minutes (prev_dep → curr_sched_dep, entire sequence)")
+    print(f"\n📊 DATA LEAKAGE-FREE FEATURES (Safe for Training):")
+    print(f"  Rotation Time Features:")
+    print(f"    - safe_lineage_rotation_time_minutes: Safe rotation time (handles data leakage)")
+    print(f"    - scheduled_lineage_rotation_time_minutes: Scheduled rotation time (prev_crs_dep → curr_crs_dep)")
+    print(f"  Turnover Time Features:")
+    print(f"    - scheduled_lineage_turnover_time_minutes: Scheduled turnover time (prev_crs_arr → curr_crs_dep)")
+    print(f"  Air Time Features:")
+    print(f"    - prev_flight_crs_elapsed_time: Scheduled air time for previous flight")
+    print(f"    - crs_elapsed_time: Scheduled air time for current flight")
+    print(f"  Required Time Features:")
+    print(f"    - required_time_prev_flight_minutes: Expected air_time + expected_turnover_time")
+    print(f"      (Uses conditional expected values if available, otherwise scheduled times)")
+    print(f"    - safe_required_time_prev_flight_minutes: Safe version (always data leakage-free)")
+    print(f"  Other Safe Features:")
+    print(f"    - safe_impossible_on_time_flag: Safe binary flag (required_time > rotation_time)")
+    print(f"\n⚠️  FEATURES WITH DATA LEAKAGE (Use with caution):")
+    print(f"    - lineage_rotation_time_minutes: Uses actual prev_dep (may have leakage)")
+    print(f"    - lineage_actual_turnover_time_minutes: Uses actual times (may have leakage)")
+    print(f"    - impossible_on_time_flag: Uses rotation_time (may have leakage)")
+    print(f"\n📈 Model Learning Objective:")
+    print(f"    departure_delay ≈ max(0, required_time - rotation_time)")
     print(f"    Rotation Time = Air Time + Turnover Time (aviation terminology)")
-    print(f"  - turnover_time features: lineage_turnover_time_minutes, lineage_actual_turnover_time_minutes")
-    print(f"  - required_time_prev_flight_minutes (expected_air_time + expected_turnover_time)")
-    print(f"  - impossible_on_time_flag (and safe variant) - binary indicator when required_time > rotation_time")
-    print(f"  Note: Model will learn: departure_delay ≈ max(0, required_time - rotation_time)")
-    print(f"All flights preserved - no rows dropped")
+    print(f"\nAll flights preserved - no rows dropped")
     print(f"[{timestamp}] ✓ Flight lineage feature generation complete! (took {duration})")
     print("=" * 60)
     
@@ -306,9 +322,31 @@ def _compute_cumulative_features(df, tail_num_col):
         ).otherwise(None)
     )
     
+    # Convert prev_flight_crs_dep_time to minutes for rotation time calculation
+    df = df.withColumn(
+        'prev_flight_crs_dep_time_minutes',
+        F.when(
+            col('prev_flight_crs_dep_time').isNotNull(),
+            (F.floor(col('prev_flight_crs_dep_time') / 100) * 60 + (col('prev_flight_crs_dep_time') % 100))
+        ).otherwise(None)
+    )
+    
+    # Compute scheduled rotation time (time between prev flight's scheduled departure and current flight's scheduled departure)
+    # This is the scheduled version of rotation_time: prev_crs_dep → curr_crs_dep (entire scheduled sequence)
+    df = df.withColumn(
+        'scheduled_lineage_rotation_time_minutes',
+        F.when(
+            (col('prev_flight_crs_dep_time_minutes').isNotNull()) & (col('crs_dep_time_minutes').isNotNull()),
+            F.when(
+                col('crs_dep_time_minutes') >= col('prev_flight_crs_dep_time_minutes'),
+                col('crs_dep_time_minutes') - col('prev_flight_crs_dep_time_minutes')
+            ).otherwise(col('crs_dep_time_minutes') + 1440 - col('prev_flight_crs_dep_time_minutes'))
+        ).otherwise(None)
+    )
+    
     # Compute scheduled turnover time (time between prev flight's scheduled arrival and current flight's scheduled departure)
     df = df.withColumn(
-        'lineage_turnover_time_minutes',
+        'scheduled_lineage_turnover_time_minutes',
         F.when(
             (col('prev_flight_crs_arr_time_minutes').isNotNull()) & (col('crs_dep_time_minutes').isNotNull()),
             F.when(
@@ -317,10 +355,6 @@ def _compute_cumulative_features(df, tail_num_col):
             ).otherwise(col('crs_dep_time_minutes') + 1440 - col('prev_flight_crs_arr_time_minutes'))
         ).otherwise(None)
     )
-    
-    # Scheduled taxi and turn time are the same as scheduled turnover time
-    df = df.withColumn('lineage_taxi_time_minutes', col('lineage_turnover_time_minutes'))
-    df = df.withColumn('lineage_turn_time_minutes', col('lineage_turnover_time_minutes'))
     
     df = df.withColumn(
         'lineage_expected_flight_time_minutes',
@@ -360,7 +394,7 @@ def _compute_time_between_prev_dep_and_sched_dep(df):
     departure_time = previous_departure_time + rotation_time
     where rotation_time = air_time + turnover_time
     
-    Note: We already have turnover time features (lineage_turnover_time_minutes, 
+    Note: We already have turnover time features (scheduled_lineage_turnover_time_minutes, 
     lineage_actual_turnover_time_minutes) which measure prev_arr → curr_dep, so we don't
     need a separate prev_arr → sched_dep feature (it would be redundant with turnover time).
     
@@ -490,26 +524,79 @@ def _compute_required_time_features(df):
     Note: We don't compute time_buffer_minutes explicitly as it's a linear combination the model can learn.
     However, we compute required_time as a convenience feature to make the relationship clearer.
     
-    Uses conditional expected values if available, otherwise falls back to scheduled times.
+    Uses conditional expected values from ConditionalExpectedValuesEstimator if available,
+    otherwise falls back to scheduled times. The ConditionalExpectedValuesEstimator should be
+    run before this function to add these columns:
+    - expected_air_time_route_temporal_minutes (temporal, Prophet-based, preferred)
+    - expected_air_time_route_minutes (route-based baseline)
+    - expected_air_time_aircraft_minutes (aircraft-based)
+    - expected_turnover_time_temporal_minutes (temporal, Prophet-based, preferred)
+    - expected_turnover_time_carrier_airport_minutes (carrier-airport baseline)
+    - expected_turnover_time_aircraft_minutes (aircraft-based)
+    
+    REQUIRED COLUMNS (must exist - function will raise error if missing):
+    - lineage_rotation_time_minutes
+    - safe_lineage_rotation_time_minutes
+    - At least one of: prev_flight_crs_elapsed_time, crs_elapsed_time (for air time fallback)
+    - scheduled_lineage_turnover_time_minutes (for turnover time fallback)
     """
-    # Try to use conditional expected values if available (from ConditionalExpectedValuesEstimator)
-    # Otherwise, fall back to scheduled/actual values
+    # Validate required columns exist - fail fast if missing
+    available_cols = set(df.columns)
+    required_cols = [
+        'lineage_rotation_time_minutes',
+        'safe_lineage_rotation_time_minutes'
+    ]
+    missing_cols = [c for c in required_cols if c not in available_cols]
+    # Check for scheduled turnover time (required)
+    if 'scheduled_lineage_turnover_time_minutes' not in available_cols:
+        missing_cols.append('scheduled_lineage_turnover_time_minutes')
+    if missing_cols:
+        raise ValueError(
+            f"Missing required columns in _compute_required_time_features: {missing_cols}. "
+            f"Available columns: {sorted(list(available_cols))[:50]}..."
+        )
     
-    # Determine which expected air time to use (prefer conditional, fallback to scheduled)
-    expected_air_time_col = F.coalesce(
-        col('expected_air_time_route_temporal_minutes'),  # Temporal conditional (best)
-        col('expected_air_time_route_minutes'),           # Route-based conditional
-        col('expected_air_time_aircraft_minutes'),        # Aircraft-based conditional
-        col('crs_elapsed_time')                           # Fallback to scheduled
-    )
+    # Validate at least one air time fallback column exists
+    if 'prev_flight_crs_elapsed_time' not in available_cols and 'crs_elapsed_time' not in available_cols:
+        raise ValueError(
+            "Missing required columns for air time fallback: neither 'prev_flight_crs_elapsed_time' "
+            "nor 'crs_elapsed_time' found in DataFrame."
+        )
     
-    # Determine which expected turnover time to use (prefer conditional, fallback to scheduled)
-    expected_turnover_time_col = F.coalesce(
-        col('expected_turnover_time_temporal_minutes'),           # Temporal conditional (best)
-        col('expected_turnover_time_carrier_airport_minutes'),    # Carrier-airport conditional
-        col('expected_turnover_time_aircraft_minutes'),           # Aircraft-based conditional
-        col('lineage_turnover_time_minutes')                      # Fallback to scheduled turnover
-    )
+    # Build coalesce expression for expected air time
+    # Order of preference: temporal (Prophet) > route > aircraft > scheduled
+    # Only include conditional expected value columns if they exist (from ConditionalExpectedValuesEstimator)
+    expected_air_time_parts = []
+    if 'expected_air_time_route_temporal_minutes' in available_cols:
+        expected_air_time_parts.append(col('expected_air_time_route_temporal_minutes'))
+    if 'expected_air_time_route_minutes' in available_cols:
+        expected_air_time_parts.append(col('expected_air_time_route_minutes'))
+    if 'expected_air_time_aircraft_minutes' in available_cols:
+        expected_air_time_parts.append(col('expected_air_time_aircraft_minutes'))
+    # Always include fallback to scheduled (validated above)
+    if 'prev_flight_crs_elapsed_time' in available_cols:
+        expected_air_time_parts.append(col('prev_flight_crs_elapsed_time'))
+    else:
+        expected_air_time_parts.append(col('crs_elapsed_time'))
+    
+    # Build coalesce expression
+    expected_air_time_col = F.coalesce(*expected_air_time_parts)
+    
+    # Build coalesce expression for expected turnover time
+    # Order of preference: temporal (Prophet) > carrier-airport > aircraft > scheduled turnover
+    # Only include conditional expected value columns if they exist (from ConditionalExpectedValuesEstimator)
+    expected_turnover_time_parts = []
+    if 'expected_turnover_time_temporal_minutes' in available_cols:
+        expected_turnover_time_parts.append(col('expected_turnover_time_temporal_minutes'))
+    if 'expected_turnover_time_carrier_airport_minutes' in available_cols:
+        expected_turnover_time_parts.append(col('expected_turnover_time_carrier_airport_minutes'))
+    if 'expected_turnover_time_aircraft_minutes' in available_cols:
+        expected_turnover_time_parts.append(col('expected_turnover_time_aircraft_minutes'))
+    # Always include fallback to scheduled turnover time (validated above)
+    expected_turnover_time_parts.append(col('scheduled_lineage_turnover_time_minutes'))
+    
+    # Build coalesce expression
+    expected_turnover_time_col = F.coalesce(*expected_turnover_time_parts)
     
     # Compute required time (flight time + turnover time)
     # This is a convenience feature - the model can also compute this from the components
@@ -737,9 +824,9 @@ def _check_data_leakage(df):
     df = df.withColumn('has_leakage_lineage_rotation_time_minutes', col('has_leakage_prev_flight_actual_dep_time'))
     
     # Required time features: Expected values are safe (computed from historical data)
-    # But impossible_on_time_flag depends on time_between, so it inherits leakage
+    # But impossible_on_time_flag depends on rotation_time, so it inherits leakage
     df = df.withColumn('has_leakage_required_time_prev_flight_minutes', F.lit(False))  # Expected values are safe
-    df = df.withColumn('has_leakage_impossible_on_time_flag', col('has_leakage_time_between_prev_dep_and_sched_dep_minutes'))
+    df = df.withColumn('has_leakage_impossible_on_time_flag', col('has_leakage_lineage_rotation_time_minutes'))
     
     # ============================================================================
     # STEP 6: Create array column listing all columns with data leakage
@@ -849,9 +936,7 @@ def _apply_imputation(df):
     df = df.withColumn('prev_flight_op_carrier_fl_num', F.coalesce(col('prev_flight_op_carrier_fl_num'), col('op_carrier_fl_num')))
     
     # Impute engineered lineage features
-    df = df.withColumn('lineage_turnover_time_minutes', F.coalesce(col('lineage_turnover_time_minutes'), F.lit(240.0)))
-    df = df.withColumn('lineage_taxi_time_minutes', F.coalesce(col('lineage_taxi_time_minutes'), col('lineage_turnover_time_minutes')))
-    df = df.withColumn('lineage_turn_time_minutes', F.coalesce(col('lineage_turn_time_minutes'), col('lineage_turnover_time_minutes')))
+    df = df.withColumn('scheduled_lineage_turnover_time_minutes', F.coalesce(col('scheduled_lineage_turnover_time_minutes'), F.lit(240.0)))
     df = df.withColumn('lineage_actual_turnover_time_minutes', F.coalesce(col('lineage_actual_turnover_time_minutes'), F.lit(240.0)))
     df = df.withColumn('lineage_actual_taxi_time_minutes', F.coalesce(col('lineage_actual_taxi_time_minutes'), col('lineage_actual_turnover_time_minutes')))
     df = df.withColumn('lineage_actual_turn_time_minutes', F.coalesce(col('lineage_actual_turn_time_minutes'), col('lineage_actual_turnover_time_minutes')))
@@ -864,6 +949,8 @@ def _apply_imputation(df):
     # Impute rotation time features (if previous flight unavailable, use scheduled departure as baseline)
     df = df.withColumn('lineage_rotation_time_minutes', 
                        F.coalesce(col('lineage_rotation_time_minutes'), F.lit(0.0)))
+    df = df.withColumn('scheduled_lineage_rotation_time_minutes',
+                       F.coalesce(col('scheduled_lineage_rotation_time_minutes'), F.lit(0.0)))
     df = df.withColumn('safe_lineage_rotation_time_minutes',
                        F.coalesce(col('safe_lineage_rotation_time_minutes'), 
                                   col('lineage_rotation_time_minutes'), F.lit(0.0)))
