@@ -56,7 +56,7 @@ def add_flight_lineage_features(df):
         - prev_flight_*: Previous flight attributes
         - lineage_*: Engineered lineage features
         - columns_with_data_leakage: Array of columns with data leakage
-        - prediction_cutoff_minutes: Cutoff time for data leakage detection
+        - prediction_cutoff_timestamp: Cutoff timestamp for data leakage detection
     
     Notes:
     ------
@@ -114,10 +114,10 @@ def add_flight_lineage_features(df):
         ).otherwise(None)
     )
     
-    # Step 6: Compute Actual Turnover Time (with data leakage check)
-    print("\nStep 6: Computing actual turnover time (with data leakage check)...")
+    # Step 6: Compute Actual Turnover Time
+    print("\nStep 6: Computing actual turnover time...")
     df = _compute_turnover_time(df)
-    print("✓ Actual turnover time computed with data leakage check")
+    print("✓ Actual turnover time computed")
     
     # Step 7: Compute Expected Flight Time and Cumulative Features
     print("\nStep 7: Computing expected flight time and cumulative features...")
@@ -215,7 +215,13 @@ def _add_previous_flight_data(df, window_spec):
 
 
 def _compute_turnover_time(df):
-    """Compute actual turnover time with data leakage check."""
+    """
+    Compute actual turnover time (time between previous flight arrival and current flight departure).
+    
+    NOTE: Data leakage detection is handled comprehensively in Step 9 (_check_data_leakage).
+    This function computes the turnover time regardless of leakage; Step 9 will mark it
+    as having leakage if the source timestamps occur after the prediction cutoff.
+    """
     df = df.withColumn(
         'prev_flight_actual_arr_time_minutes',
         F.when(
@@ -232,20 +238,13 @@ def _compute_turnover_time(df):
         ).otherwise(None)
     )
     
-    # Check data leakage: prev_arr_time must be <= crs_dep_time - 2 hours (120 minutes)
-    df = df.withColumn(
-        'prev_arr_time_safe_to_use',
-        F.when(
-            (col('prev_flight_actual_arr_time_minutes').isNotNull()) & (col('crs_dep_time_minutes').isNotNull()),
-            col('prev_flight_actual_arr_time_minutes') <= (col('crs_dep_time_minutes') - 120)
-        ).otherwise(False)
-    )
-    
-    # Actual turnover time (only compute if safe)
+    # Compute actual turnover time
+    # NOTE: Data leakage is checked in Step 9, which will mark this feature as having
+    # leakage if either prev_flight_actual_arr_time or actual_dep_time occurs after
+    # the prediction cutoff timestamp.
     df = df.withColumn(
         'lineage_actual_turnover_time_minutes',
         F.when(
-            (col('prev_arr_time_safe_to_use') == True) &
             (col('actual_dep_time_minutes').isNotNull()) &
             (col('prev_flight_actual_arr_time_minutes').isNotNull()),
             F.when(
@@ -317,13 +316,40 @@ def _compute_cumulative_features(df, tail_num_col):
 
 
 def _check_data_leakage(df):
-    """Check for data leakage in all risky columns."""
-    # Create prediction cutoff
-    df = df.withColumn(
-        'prediction_cutoff_minutes',
-        F.when(col('crs_dep_time_minutes').isNotNull(), col('crs_dep_time_minutes') - 120).otherwise(None)
-    )
+    """
+    Check for data leakage in all risky columns.
     
+    PURPOSE:
+    Identify any fields which would have been realized **after** the prediction cutoff timestamp,
+    which is two hours before the scheduled departure time. In production, our model would not
+    know these timestamps at prediction time, so they represent data leakage.
+    
+    DATA LEAKAGE RULES:
+    1. **Scheduled times are SAFE**: Scheduled times (crs_dep_time, crs_arr_time, etc.) are known
+       in advance and are safe to use, even if they occur after the cutoff.
+    
+    2. **Actual timestamps are RISKY**: Any actual timestamps (actual_dep_time, actual_arr_time,
+       wheels_off, wheels_on) that occur AFTER the cutoff are NOT SAFE, as in production our model
+       would not know these timestamps to make predictions.
+    
+    3. **Engineered features inherit leakage**: Any engineered features derived from leakage features
+       also contain data leakage. For example:
+       - If actual_arr_time has leakage, then any feature using it (like flight_time = actual_arr - actual_dep)
+         also has leakage, even if actual_dep does not have leakage.
+       - If either actual_dep_time OR actual_arr_time has leakage, then air_time (derived from both) has leakage.
+    
+    LOGIC:
+    - Prediction cutoff = scheduled_departure_time - 2 hours
+    - Data leakage = actual_timestamp > prediction_cutoff_timestamp
+    - Duration/status fields inherit leakage from their source timestamp columns
+    - Engineered features inherit leakage from any of their source columns
+    """
+    # ============================================================================
+    # STEP 1: Create prediction cutoff timestamp
+    # ============================================================================
+    # The cutoff is 2 hours before scheduled departure time.
+    # Any actual timestamps that occur AFTER this cutoff would not be known
+    # in production at prediction time.
     df = df.withColumn(
         'prediction_cutoff_timestamp',
         F.when(
@@ -332,137 +358,198 @@ def _check_data_leakage(df):
         ).otherwise(None)
     )
     
-    # Convert all actual time columns to minutes for checking
+    # ============================================================================
+    # STEP 2: Convert actual time columns to timestamps for comparison
+    # ============================================================================
+    # Convert HHMM format times to full timestamps using the previous flight's date.
+    # These timestamps will be compared against the prediction cutoff to detect leakage.
+    # NOTE: Scheduled times (crs_*) are NOT checked here because they are safe by definition.
     df = df.withColumn(
-        'prev_flight_actual_dep_time_minutes',
+        'prev_flight_actual_dep_timestamp',
         F.when(
-            col('prev_flight_actual_dep_time').isNotNull(),
-            (F.floor(col('prev_flight_actual_dep_time') / 100) * 60 + (col('prev_flight_actual_dep_time') % 100))
+            (col('prev_flight_actual_dep_time').isNotNull()) & (col('prev_flight_fl_date').isNotNull()),
+            F.to_timestamp(
+                F.concat(col('prev_flight_fl_date'), F.lpad(col('prev_flight_actual_dep_time').cast('string'), 4, '0')),
+                'yyyy-MM-ddHHmm'
+            )
         ).otherwise(None)
     )
     
     df = df.withColumn(
-        'prev_flight_wheels_off_minutes',
+        'prev_flight_actual_arr_timestamp',
         F.when(
-            col('prev_flight_wheels_off').isNotNull(),
-            (F.floor(col('prev_flight_wheels_off') / 100) * 60 + (col('prev_flight_wheels_off') % 100))
+            (col('prev_flight_actual_arr_time').isNotNull()) & (col('prev_flight_fl_date').isNotNull()),
+            F.to_timestamp(
+                F.concat(col('prev_flight_fl_date'), F.lpad(col('prev_flight_actual_arr_time').cast('string'), 4, '0')),
+                'yyyy-MM-ddHHmm'
+            )
         ).otherwise(None)
     )
     
     df = df.withColumn(
-        'prev_flight_wheels_on_minutes',
+        'prev_flight_wheels_off_timestamp',
         F.when(
-            col('prev_flight_wheels_on').isNotNull(),
-            (F.floor(col('prev_flight_wheels_on') / 100) * 60 + (col('prev_flight_wheels_on') % 100))
+            (col('prev_flight_wheels_off').isNotNull()) & (col('prev_flight_fl_date').isNotNull()),
+            F.to_timestamp(
+                F.concat(col('prev_flight_fl_date'), F.lpad(col('prev_flight_wheels_off').cast('string'), 4, '0')),
+                'yyyy-MM-ddHHmm'
+            )
         ).otherwise(None)
     )
     
-    # Check each risky timestamp column for data leakage
     df = df.withColumn(
-        'prev_flight_actual_dep_time_has_leakage',
+        'prev_flight_wheels_on_timestamp',
         F.when(
-            (col('prev_flight_actual_dep_time_minutes').isNotNull()) & (col('prediction_cutoff_minutes').isNotNull()),
-            col('prev_flight_actual_dep_time_minutes') > col('prediction_cutoff_minutes')
+            (col('prev_flight_wheels_on').isNotNull()) & (col('prev_flight_fl_date').isNotNull()),
+            F.to_timestamp(
+                F.concat(col('prev_flight_fl_date'), F.lpad(col('prev_flight_wheels_on').cast('string'), 4, '0')),
+                'yyyy-MM-ddHHmm'
+            )
+        ).otherwise(None)
+    )
+    
+    # ============================================================================
+    # STEP 3: Check each actual timestamp column for data leakage
+    # ============================================================================
+    # Data leakage occurs when: actual_timestamp > prediction_cutoff_timestamp
+    # This means the actual event happened AFTER the cutoff, so in production
+    # we would not know this information at prediction time.
+    
+    df = df.withColumn(
+        'has_leakage_prev_flight_actual_dep_time',
+        F.when(
+            (col('prev_flight_actual_dep_timestamp').isNotNull()) & (col('prediction_cutoff_timestamp').isNotNull()),
+            col('prev_flight_actual_dep_timestamp') > col('prediction_cutoff_timestamp')
         ).otherwise(False)
     )
     
     df = df.withColumn(
-        'prev_flight_actual_arr_time_has_leakage',
+        'has_leakage_prev_flight_actual_arr_time',
         F.when(
-            (col('prev_flight_actual_arr_time_minutes').isNotNull()) & (col('prediction_cutoff_minutes').isNotNull()),
-            col('prev_flight_actual_arr_time_minutes') > col('prediction_cutoff_minutes')
+            (col('prev_flight_actual_arr_timestamp').isNotNull()) & (col('prediction_cutoff_timestamp').isNotNull()),
+            col('prev_flight_actual_arr_timestamp') > col('prediction_cutoff_timestamp')
         ).otherwise(False)
     )
     
     df = df.withColumn(
-        'prev_flight_wheels_off_has_leakage',
+        'has_leakage_prev_flight_wheels_off',
         F.when(
-            (col('prev_flight_wheels_off_minutes').isNotNull()) & (col('prediction_cutoff_minutes').isNotNull()),
-            col('prev_flight_wheels_off_minutes') > col('prediction_cutoff_minutes')
+            (col('prev_flight_wheels_off_timestamp').isNotNull()) & (col('prediction_cutoff_timestamp').isNotNull()),
+            col('prev_flight_wheels_off_timestamp') > col('prediction_cutoff_timestamp')
         ).otherwise(False)
     )
     
     df = df.withColumn(
-        'prev_flight_wheels_on_has_leakage',
+        'has_leakage_prev_flight_wheels_on',
         F.when(
-            (col('prev_flight_wheels_on_minutes').isNotNull()) & (col('prediction_cutoff_minutes').isNotNull()),
-            col('prev_flight_wheels_on_minutes') > col('prediction_cutoff_minutes')
+            (col('prev_flight_wheels_on_timestamp').isNotNull()) & (col('prediction_cutoff_timestamp').isNotNull()),
+            col('prev_flight_wheels_on_timestamp') > col('prediction_cutoff_timestamp')
         ).otherwise(False)
     )
     
-    # For duration fields, check if their source columns have data leakage
-    df = df.withColumn('prev_flight_dep_delay_has_leakage', col('prev_flight_actual_dep_time_has_leakage'))
-    df = df.withColumn('prev_flight_arr_delay_has_leakage', col('prev_flight_actual_arr_time_has_leakage'))
-    df = df.withColumn('prev_flight_taxi_in_has_leakage', col('prev_flight_wheels_on_has_leakage'))
-    df = df.withColumn('prev_flight_taxi_out_has_leakage', col('prev_flight_wheels_off_has_leakage'))
+    # ============================================================================
+    # STEP 4: Derive leakage for duration/status fields from source timestamps
+    # ============================================================================
+    # Duration and status fields inherit leakage from their source timestamp columns.
+    # For example:
+    # - dep_delay is derived from actual_dep_time, so it has leakage if actual_dep_time has leakage
+    # - arr_delay is derived from actual_arr_time, so it has leakage if actual_arr_time has leakage
+    # - taxi_in is derived from wheels_on, so it has leakage if wheels_on has leakage
+    # - taxi_out is derived from wheels_off, so it has leakage if wheels_off has leakage
+    # - air_time uses both actual_dep_time AND actual_arr_time, so it has leakage if EITHER has leakage
+    # - cancelled/diverted status is known only after the flight occurs, so it has leakage if EITHER dep or arr has leakage
+    df = df.withColumn('has_leakage_prev_flight_dep_delay', col('has_leakage_prev_flight_actual_dep_time'))
+    df = df.withColumn('has_leakage_prev_flight_arr_delay', col('has_leakage_prev_flight_actual_arr_time'))
+    df = df.withColumn('has_leakage_prev_flight_taxi_in', col('has_leakage_prev_flight_wheels_on'))
+    df = df.withColumn('has_leakage_prev_flight_taxi_out', col('has_leakage_prev_flight_wheels_off'))
     df = df.withColumn(
-        'prev_flight_air_time_has_leakage',
-        (col('prev_flight_actual_dep_time_has_leakage') | col('prev_flight_actual_arr_time_has_leakage'))
+        'has_leakage_prev_flight_air_time',
+        (col('has_leakage_prev_flight_actual_dep_time') | col('has_leakage_prev_flight_actual_arr_time'))
     )
     df = df.withColumn(
-        'prev_flight_actual_elapsed_time_has_leakage',
-        (col('prev_flight_actual_dep_time_has_leakage') | col('prev_flight_actual_arr_time_has_leakage'))
+        'has_leakage_prev_flight_actual_elapsed_time',
+        (col('has_leakage_prev_flight_actual_dep_time') | col('has_leakage_prev_flight_actual_arr_time'))
     )
     
     df = df.withColumn(
-        'prev_flight_cancelled_has_leakage',
+        'has_leakage_prev_flight_cancelled',
         F.when(
             col('prev_flight_cancelled').isNotNull(),
-            (col('prev_flight_actual_dep_time_has_leakage') | col('prev_flight_actual_arr_time_has_leakage'))
+            (col('has_leakage_prev_flight_actual_dep_time') | col('has_leakage_prev_flight_actual_arr_time'))
         ).otherwise(False)
     )
     
     df = df.withColumn(
-        'prev_flight_diverted_has_leakage',
+        'has_leakage_prev_flight_diverted',
         F.when(
             col('prev_flight_diverted').isNotNull(),
-            (col('prev_flight_actual_dep_time_has_leakage') | col('prev_flight_actual_arr_time_has_leakage'))
+            (col('has_leakage_prev_flight_actual_dep_time') | col('has_leakage_prev_flight_actual_arr_time'))
         ).otherwise(False)
     )
     
-    # Engineered features using actual times
+    # ============================================================================
+    # STEP 5: Derive leakage for engineered features from source columns
+    # ============================================================================
+    # Engineered features inherit leakage from ANY of their source columns.
+    # Example: lineage_actual_turnover_time = actual_dep_time - actual_arr_time
+    # If EITHER actual_dep_time OR actual_arr_time has leakage, then the turnover time
+    # feature also has leakage (because we wouldn't know one of the values in production).
+    
+    # Turnover time features use both actual_arr_time and actual_dep_time
     df = df.withColumn(
-        'lineage_actual_turnover_time_minutes_has_leakage',
-        (col('prev_flight_actual_arr_time_has_leakage') | col('prev_flight_actual_dep_time_has_leakage'))
+        'has_leakage_lineage_actual_turnover_time_minutes',
+        (col('has_leakage_prev_flight_actual_arr_time') | col('has_leakage_prev_flight_actual_dep_time'))
     )
-    df = df.withColumn('lineage_actual_taxi_time_minutes_has_leakage', col('lineage_actual_turnover_time_minutes_has_leakage'))
-    df = df.withColumn('lineage_actual_turn_time_minutes_has_leakage', col('lineage_actual_turnover_time_minutes_has_leakage'))
+    # Aliases inherit the same leakage
+    df = df.withColumn('has_leakage_lineage_actual_taxi_time_minutes', col('has_leakage_lineage_actual_turnover_time_minutes'))
+    df = df.withColumn('has_leakage_lineage_actual_turn_time_minutes', col('has_leakage_lineage_actual_turnover_time_minutes'))
     
-    # Cumulative features derived from actual delays
-    df = df.withColumn('lineage_cumulative_delay_has_leakage', col('prev_flight_dep_delay_has_leakage'))
-    df = df.withColumn('lineage_avg_delay_previous_flights_has_leakage', col('prev_flight_dep_delay_has_leakage'))
-    df = df.withColumn('lineage_max_delay_previous_flights_has_leakage', col('prev_flight_dep_delay_has_leakage'))
+    # Cumulative features are derived from actual delays, which inherit leakage from actual_dep_time
+    df = df.withColumn('has_leakage_lineage_cumulative_delay', col('has_leakage_prev_flight_dep_delay'))
+    df = df.withColumn('has_leakage_lineage_avg_delay_previous_flights', col('has_leakage_prev_flight_dep_delay'))
+    df = df.withColumn('has_leakage_lineage_max_delay_previous_flights', col('has_leakage_prev_flight_dep_delay'))
     
-    # Create an array column listing all columns that have data leakage
+    # ============================================================================
+    # STEP 6: Create array column listing all columns with data leakage
+    # ============================================================================
+    # This array column dynamically lists, for each row, which specific columns have
+    # data leakage. This is useful for debugging and for filtering features in the model pipeline.
     df = df.withColumn(
         'columns_with_data_leakage',
         F.array_remove(
             F.array([
-                F.when(col('prev_flight_actual_dep_time_has_leakage'), F.lit('prev_flight_actual_dep_time')).otherwise(None),
-                F.when(col('prev_flight_actual_arr_time_has_leakage'), F.lit('prev_flight_actual_arr_time')).otherwise(None),
-                F.when(col('prev_flight_wheels_off_has_leakage'), F.lit('prev_flight_wheels_off')).otherwise(None),
-                F.when(col('prev_flight_wheels_on_has_leakage'), F.lit('prev_flight_wheels_on')).otherwise(None),
-                F.when(col('prev_flight_dep_delay_has_leakage'), F.lit('prev_flight_dep_delay')).otherwise(None),
-                F.when(col('prev_flight_arr_delay_has_leakage'), F.lit('prev_flight_arr_delay')).otherwise(None),
-                F.when(col('prev_flight_air_time_has_leakage'), F.lit('prev_flight_air_time')).otherwise(None),
-                F.when(col('prev_flight_taxi_in_has_leakage'), F.lit('prev_flight_taxi_in')).otherwise(None),
-                F.when(col('prev_flight_taxi_out_has_leakage'), F.lit('prev_flight_taxi_out')).otherwise(None),
-                F.when(col('prev_flight_actual_elapsed_time_has_leakage'), F.lit('prev_flight_actual_elapsed_time')).otherwise(None),
-                F.when(col('prev_flight_cancelled_has_leakage'), F.lit('prev_flight_cancelled')).otherwise(None),
-                F.when(col('prev_flight_diverted_has_leakage'), F.lit('prev_flight_diverted')).otherwise(None),
-                F.when(col('lineage_actual_turnover_time_minutes_has_leakage'), F.lit('lineage_actual_turnover_time_minutes')).otherwise(None),
-                F.when(col('lineage_actual_taxi_time_minutes_has_leakage'), F.lit('lineage_actual_taxi_time_minutes')).otherwise(None),
-                F.when(col('lineage_actual_turn_time_minutes_has_leakage'), F.lit('lineage_actual_turn_time_minutes')).otherwise(None),
-                F.when(col('lineage_cumulative_delay_has_leakage'), F.lit('lineage_cumulative_delay')).otherwise(None),
-                F.when(col('lineage_avg_delay_previous_flights_has_leakage'), F.lit('lineage_avg_delay_previous_flights')).otherwise(None),
-                F.when(col('lineage_max_delay_previous_flights_has_leakage'), F.lit('lineage_max_delay_previous_flights')).otherwise(None)
+                F.when(col('has_leakage_prev_flight_actual_dep_time'), F.lit('prev_flight_actual_dep_time')).otherwise(None),
+                F.when(col('has_leakage_prev_flight_actual_arr_time'), F.lit('prev_flight_actual_arr_time')).otherwise(None),
+                F.when(col('has_leakage_prev_flight_wheels_off'), F.lit('prev_flight_wheels_off')).otherwise(None),
+                F.when(col('has_leakage_prev_flight_wheels_on'), F.lit('prev_flight_wheels_on')).otherwise(None),
+                F.when(col('has_leakage_prev_flight_dep_delay'), F.lit('prev_flight_dep_delay')).otherwise(None),
+                F.when(col('has_leakage_prev_flight_arr_delay'), F.lit('prev_flight_arr_delay')).otherwise(None),
+                F.when(col('has_leakage_prev_flight_air_time'), F.lit('prev_flight_air_time')).otherwise(None),
+                F.when(col('has_leakage_prev_flight_taxi_in'), F.lit('prev_flight_taxi_in')).otherwise(None),
+                F.when(col('has_leakage_prev_flight_taxi_out'), F.lit('prev_flight_taxi_out')).otherwise(None),
+                F.when(col('has_leakage_prev_flight_actual_elapsed_time'), F.lit('prev_flight_actual_elapsed_time')).otherwise(None),
+                F.when(col('has_leakage_prev_flight_cancelled'), F.lit('prev_flight_cancelled')).otherwise(None),
+                F.when(col('has_leakage_prev_flight_diverted'), F.lit('prev_flight_diverted')).otherwise(None),
+                F.when(col('has_leakage_lineage_actual_turnover_time_minutes'), F.lit('lineage_actual_turnover_time_minutes')).otherwise(None),
+                F.when(col('has_leakage_lineage_actual_taxi_time_minutes'), F.lit('lineage_actual_taxi_time_minutes')).otherwise(None),
+                F.when(col('has_leakage_lineage_actual_turn_time_minutes'), F.lit('lineage_actual_turn_time_minutes')).otherwise(None),
+                F.when(col('has_leakage_lineage_cumulative_delay'), F.lit('lineage_cumulative_delay')).otherwise(None),
+                F.when(col('has_leakage_lineage_avg_delay_previous_flights'), F.lit('lineage_avg_delay_previous_flights')).otherwise(None),
+                F.when(col('has_leakage_lineage_max_delay_previous_flights'), F.lit('lineage_max_delay_previous_flights')).otherwise(None)
             ]),
             None
         )
     )
     
-    df = df.withColumn('prev_arr_time_safe_to_use', ~col('prev_flight_actual_arr_time_has_leakage'))
-    df = df.withColumn('prev_dep_time_safe_to_use', ~col('prev_flight_actual_dep_time_has_leakage'))
+    # ============================================================================
+    # STEP 7: Create convenience flags for safe-to-use columns
+    # ============================================================================
+    # These flags are the inverse of the leakage flags, indicating when it's safe
+    # to use actual times in feature engineering. These can be used downstream
+    # in model pipelines to conditionally use features only when the source data
+    # is safe from leakage.
+    df = df.withColumn('prev_arr_time_safe_to_use', ~col('has_leakage_prev_flight_actual_arr_time'))
+    df = df.withColumn('prev_dep_time_safe_to_use', ~col('has_leakage_prev_flight_actual_dep_time'))
     
     return df
 
@@ -543,4 +630,3 @@ def _apply_imputation(df):
     df = df.drop('prev_flight_crs_dep_time_minutes')
     
     return df
-
