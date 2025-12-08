@@ -44,6 +44,7 @@ class FlightDelayDataLoader:
     def __init__(self):
         self.folds = {}
         self.numerical_features = [
+            # Weather features
             'hourlyprecipitation',
             'hourlysealevelpressure',
             'hourlyaltimetersetting',
@@ -55,10 +56,45 @@ class FlightDelayDataLoader:
             'hourlydewpointtemperature',
             'hourlydrybulbtemperature',
             'hourlyvisibility',
+
+            # Flight Lineage Features from flight_lineage_features.py
             'crs_elapsed_time',
             'distance',
             'elevation',
-        ] #TODO: Append numerical features from flight lineage to cast as numbers
+            # Flight Lineage Features from flight_lineage_features.py
+            # IMPORTANT: When new numeric features are added to flight_lineage_features.py,
+            # they must also be added to this list to ensure proper type casting.
+            # See flight_lineage_features.py for complete feature documentation.
+            'lineage_rank',  # Rank of flight in aircraft's sequence (integer)
+            # Previous flight delay features
+            'prev_flight_dep_delay',  # Previous flight departure delay (minutes)
+            'prev_flight_arr_delay',  # Previous flight arrival delay (minutes)
+            # Previous flight time features
+            'prev_flight_air_time',  # Previous flight air time (minutes)
+            'prev_flight_crs_elapsed_time',  # Previous flight scheduled elapsed time (minutes)
+            'prev_flight_taxi_in',  # Previous flight taxi-in time (minutes)
+            'prev_flight_taxi_out',  # Previous flight taxi-out time (minutes)
+            'prev_flight_actual_elapsed_time',  # Previous flight actual elapsed time (minutes)
+            # Previous flight route features
+            'prev_flight_distance',  # Previous flight distance (miles)
+            # Turnover time features (scheduled)
+            'lineage_turnover_time_minutes',  # Time between prev flight scheduled arrival and current scheduled departure (minutes)
+            'lineage_taxi_time_minutes',  # Alias for lineage_turnover_time_minutes
+            'lineage_turn_time_minutes',  # Alias for lineage_turnover_time_minutes
+            # Turnover time features (actual - may have data leakage)
+            'lineage_actual_turnover_time_minutes',  # Time between prev flight actual arrival and current actual departure (minutes)
+            'lineage_actual_taxi_time_minutes',  # Alias for lineage_actual_turnover_time_minutes
+            'lineage_actual_turn_time_minutes',  # Alias for lineage_actual_turnover_time_minutes
+            # Expected flight time
+            'lineage_expected_flight_time_minutes',  # Expected flight time: scheduled arrival - scheduled departure (minutes)
+            # Cumulative delay features (may have data leakage)
+            'lineage_cumulative_delay',  # Total delay accumulated by previous flights (minutes)
+            'lineage_num_previous_flights',  # Number of flights the aircraft has already completed
+            'lineage_avg_delay_previous_flights',  # Average delay across previous flights (minutes)
+            'lineage_max_delay_previous_flights',  # Maximum delay in previous flights (minutes)
+            # Data leakage detection
+            'prediction_cutoff_minutes',  # Scheduled departure time minus 2 hours (minutes since midnight)
+        ]
 
     def _cast_numerics(self, df):
         """Safely cast all configured numeric columns to doubles."""
@@ -218,22 +254,110 @@ class FlightDelayCV:
     
     def fit(self):
         # CV folds only (exclude last test fold)
-        for train_df, val_df in self.folds[:-1]:
+        results = []
+        for i, (train_df, val_df) in enumerate(self.folds[:-1]):
             model = self.estimator.fit(train_df)
-            preds = model.transform(val_df)
+            
+            # Evaluate on training set
+            train_preds = model.transform(train_df)
+            train_metric = self.evaluator.evaluate(train_preds)
+            
+            # Evaluate on validation set
+            val_preds = model.transform(val_df)
+            val_metric = self.evaluator.evaluate(val_preds)
 
-            metric = self.evaluator.evaluate(preds)
-            self.metrics.append(metric)
+            self.metrics.append(val_metric)
             self.models.append(model)
+            
+            # Add both train and val results
+            results.append({**{f"{k}_train": v for k, v in train_metric.items()}, 
+                          **{f"{k}_val": v for k, v in val_metric.items()},
+                          'fold': f'Fold {i}'})
 
-        m = pd.DataFrame(self.metrics)
-        m.loc["mean"] = m.mean()
-        m.loc["std"] = m.std()
+        # Create DataFrame with alternating Train/Val rows
+        formatted_results = []
+        for result in results:
+            fold = result['fold']
+            # Train row
+            formatted_results.append({
+                'Fold': f"{fold} Train",
+                'rmse': result['rmse_train'],
+                'otpa': result['otpa_train'],
+                'sddr': result['sddr_train']
+            })
+            # Val row
+            formatted_results.append({
+                'Fold': f"{fold} Val",
+                'rmse': result['rmse_val'],
+                'otpa': result['otpa_val'],
+                'sddr': result['sddr_val']
+            })
+        
+        m = pd.DataFrame(formatted_results)
+        
+        # Calculate mean and std for train and val separately
+        train_rows = m[m['Fold'].str.contains('Train')]
+        val_rows = m[m['Fold'].str.contains('Val')]
+        
+        mean_train = pd.DataFrame([{
+            'Fold': 'Mean Train',
+            'rmse': train_rows['rmse'].mean(),
+            'otpa': train_rows['otpa'].mean(),
+            'sddr': train_rows['sddr'].mean()
+        }])
+        
+        std_train = pd.DataFrame([{
+            'Fold': 'Std Train',
+            'rmse': train_rows['rmse'].std(),
+            'otpa': train_rows['otpa'].std(),
+            'sddr': train_rows['sddr'].std()
+        }])
+        
+        mean_val = pd.DataFrame([{
+            'Fold': 'Mean Val',
+            'rmse': val_rows['rmse'].mean(),
+            'otpa': val_rows['otpa'].mean(),
+            'sddr': val_rows['sddr'].mean()
+        }])
+        
+        std_val = pd.DataFrame([{
+            'Fold': 'Std Val',
+            'rmse': val_rows['rmse'].std(),
+            'otpa': val_rows['otpa'].std(),
+            'sddr': val_rows['sddr'].std()
+        }])
+        
+        m = pd.concat([m, mean_train, std_train, mean_val, std_val], ignore_index=True)
         return m
 
     def evaluate(self):
         train_df, test_df = self.folds[-1]
         self.test_model = self.estimator.fit(train_df)
-        preds = self.test_model.transform(test_df)
-        self.test_metric = self.evaluator.evaluate(preds)
-        return self.test_metric
+        
+        # Evaluate on training set
+        train_preds = self.test_model.transform(train_df)
+        train_metric = self.evaluator.evaluate(train_preds)
+        
+        # Evaluate on test set
+        test_preds = self.test_model.transform(test_df)
+        test_metric = self.evaluator.evaluate(test_preds)
+        
+        self.test_metric = test_metric
+        
+        # Create DataFrame with Train and Test rows
+        results = pd.DataFrame([
+            {
+                'Split': 'Train',
+                'rmse': train_metric['rmse'],
+                'otpa': train_metric['otpa'],
+                'sddr': train_metric['sddr']
+            },
+            {
+                'Split': 'Test',
+                'rmse': test_metric['rmse'],
+                'otpa': test_metric['otpa'],
+                'sddr': test_metric['sddr']
+            }
+        ])
+        
+        return results
