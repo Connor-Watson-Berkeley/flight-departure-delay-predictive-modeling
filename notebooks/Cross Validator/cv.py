@@ -252,6 +252,26 @@ class FlightDelayCV:
         # CV folds only (exclude last test fold)
         results = []
         for i, (train_df, val_df) in enumerate(self.folds[:-1]):
+            fold_index = i  # Use 0-based indexing (0, 1, 2)
+            
+            # Set version and fold_index on estimator if it supports it
+            # This allows estimators like ConditionalExpectedValuesEstimator to know which fold
+            # lookup tables to use during fit/transform
+            if hasattr(self.estimator, 'setVersion'):
+                # If estimator has setVersion method, set version from CV
+                self.estimator.setVersion(self.version)
+            if hasattr(self.estimator, 'setFoldIndex'):
+                # If estimator has setFoldIndex method, use it
+                self.estimator.setFoldIndex(fold_index)
+            
+            # If it's a Pipeline, try to set version and fold_index on stages that support it
+            if hasattr(self.estimator, 'stages'):
+                for stage in self.estimator.getStages():
+                    if hasattr(stage, 'setVersion'):
+                        stage.setVersion(self.version)
+                    if hasattr(stage, 'setFoldIndex'):
+                        stage.setFoldIndex(fold_index)
+
             model = self.estimator.fit(train_df)
             
             # Evaluate on training set
@@ -328,6 +348,23 @@ class FlightDelayCV:
 
     def evaluate(self):
         train_df, test_df = self.folds[-1]
+
+        fold_index = 3  # Test fold is always at index 3 (0-based: folds are 0, 1, 2, 3)
+        
+        # Set version and fold_index on estimator if it supports it
+        if hasattr(self.estimator, 'setVersion'):
+            self.estimator.setVersion(self.version)
+        if hasattr(self.estimator, 'setFoldIndex'):
+            self.estimator.setFoldIndex(fold_index)
+        
+        # If it's a Pipeline, try to set version and fold_index on stages that support it
+        if hasattr(self.estimator, 'stages'):
+            for stage in self.estimator.getStages():
+                if hasattr(stage, 'setVersion'):
+                    stage.setVersion(self.version)
+                if hasattr(stage, 'setFoldIndex'):
+                    stage.setFoldIndex(fold_index)
+
         self.test_model = self.estimator.fit(train_df)
         
         # Evaluate on training set
