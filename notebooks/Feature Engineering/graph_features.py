@@ -6,7 +6,7 @@ Computes PageRank features (weighted and unweighted) from flight network graph.
 """
 
 from pyspark.sql import SparkSession, functions as F
-from pyspark.sql.functions import col
+from pyspark.sql.functions import col, broadcast
 from pyspark.ml.base import Estimator, Model
 from graphframes import GraphFrame
 from datetime import datetime
@@ -26,11 +26,15 @@ class GraphFeaturesModel(Model):
         if self.pagerank_scores is None:
             raise ValueError("Model must be fitted before transform()")
         
+        # Broadcast the small pagerank_scores DataFrame for faster joins
+        # (pagerank_scores is small - just airports, typically < 1000 rows)
+        pagerank_broadcast = broadcast(self.pagerank_scores)
+        
         # Join PageRank scores for origin and destination airports
         df_with_features = (
             df
             .join(
-                self.pagerank_scores,
+                pagerank_broadcast,
                 col(self.origin_col) == col("airport"),
                 "left"
             )
@@ -38,7 +42,7 @@ class GraphFeaturesModel(Model):
             .withColumnRenamed("pagerank_unweighted", "origin_pagerank_unweighted")
             .drop("airport")
             .join(
-                self.pagerank_scores,
+                pagerank_broadcast,
                 col(self.dest_col) == col("airport"),
                 "left"
             )
@@ -185,4 +189,3 @@ class GraphFeaturesEstimator(Estimator):
             origin_col=self.origin_col,
             dest_col=self.dest_col
         )
-
