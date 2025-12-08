@@ -21,6 +21,14 @@ from datetime import datetime, timedelta
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 
+# Load module from our Databricks repo
+import importlib.util
+
+flight_lineage_features_path = "/Workspace/Shared/Team 4_2/flight-departure-delay-predictive-modeling/notebooks/Feature Engineering/flight_lineage_features.py"
+spec = importlib.util.spec_from_file_location("flight_lineage_features", flight_lineage_features_path)
+flight_lineage_features = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(flight_lineage_features)
+
 
 # -------------------------
 # HARD-CODED SETTINGS
@@ -192,6 +200,9 @@ if __name__ == "__main__":
         print(f"📥 Reading: {path}")
 
         df = spark.read.parquet(path)
+
+        # Joins in flight lineage features
+        df = flight_lineage_features.add_flight_lineage_features(df)
 
         folds = create_sliding_window_folds(
             df=df,
