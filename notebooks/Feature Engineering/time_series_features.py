@@ -37,6 +37,11 @@ class TimeSeriesFeaturesModel(Model):
         self.carrier_col = carrier_col
         self.origin_col = origin_col
         self._spark = SparkSession.builder.getOrCreate()
+        
+        # Cache Spark DataFrames to avoid recreating them on every transform
+        self._global_spark_features = None
+        self._carrier_spark_features = None
+        self._airport_spark_features = None
     
     def _transform(self, df):
         """Join Prophet time-series features to input DataFrame"""
@@ -47,35 +52,39 @@ class TimeSeriesFeaturesModel(Model):
         
         # Join global features (by date)
         if self.global_features is not None:
-            global_spark = self._spark.createDataFrame(self.global_features)
-            # Select only feature columns (exclude join keys to avoid ambiguity)
-            global_feature_cols = [c for c in global_spark.columns if c not in ['ds', 'date_str']]
-            # Rename join key to avoid ambiguity, keep feature column names as-is
-            global_spark_features = global_spark.select(
-                [col("date_str").alias("global_date_str")] + 
-                [col(c) for c in global_feature_cols]
-            )
+            # Create Spark DataFrame once and cache it
+            if self._global_spark_features is None:
+                global_spark = self._spark.createDataFrame(self.global_features)
+                # Select only feature columns (exclude join keys to avoid ambiguity)
+                global_feature_cols = [c for c in global_spark.columns if c not in ['ds', 'date_str']]
+                # Rename join key to avoid ambiguity, keep feature column names as-is
+                self._global_spark_features = global_spark.select(
+                    [col("date_str").alias("global_date_str")] + 
+                    [col(c) for c in global_feature_cols]
+                ).cache()  # Cache to avoid recomputation (materialized on first use)
             
             df_with_features = df_with_features.join(
-                global_spark_features,
+                self._global_spark_features,
                 col(self.date_col) == col("global_date_str"),
                 "left"
             ).drop("global_date_str")  # Drop the join key after joining
         
         # Join carrier features (by carrier and date)
         if self.carrier_features is not None:
-            carrier_spark = self._spark.createDataFrame(self.carrier_features)
-            # Select only feature columns (exclude join keys to avoid ambiguity)
-            carrier_feature_cols = [c for c in carrier_spark.columns if c not in ['ds', 'date_str', 'carrier']]
-            # Rename join keys to avoid ambiguity, keep feature column names as-is
-            carrier_spark_features = carrier_spark.select(
-                [col("carrier").alias("carrier_join_key"),
-                 col("date_str").alias("carrier_date_str")] + 
-                [col(c) for c in carrier_feature_cols]
-            )
+            # Create Spark DataFrame once and cache it
+            if self._carrier_spark_features is None:
+                carrier_spark = self._spark.createDataFrame(self.carrier_features)
+                # Select only feature columns (exclude join keys to avoid ambiguity)
+                carrier_feature_cols = [c for c in carrier_spark.columns if c not in ['ds', 'date_str', 'carrier']]
+                # Rename join keys to avoid ambiguity, keep feature column names as-is
+                self._carrier_spark_features = carrier_spark.select(
+                    [col("carrier").alias("carrier_join_key"),
+                     col("date_str").alias("carrier_date_str")] + 
+                    [col(c) for c in carrier_feature_cols]
+                ).cache()  # Cache to avoid recomputation (materialized on first use)
             
             df_with_features = df_with_features.join(
-                carrier_spark_features,
+                self._carrier_spark_features,
                 (col(self.carrier_col) == col("carrier_join_key")) & 
                 (col(self.date_col) == col("carrier_date_str")),
                 "left"
@@ -83,18 +92,20 @@ class TimeSeriesFeaturesModel(Model):
         
         # Join airport features (by origin airport and date)
         if self.airport_features is not None:
-            airport_spark = self._spark.createDataFrame(self.airport_features)
-            # Select only feature columns (exclude join keys to avoid ambiguity)
-            airport_feature_cols = [c for c in airport_spark.columns if c not in ['ds', 'date_str', 'origin']]
-            # Rename join keys to avoid ambiguity, keep feature column names as-is
-            airport_spark_features = airport_spark.select(
-                [col("origin").alias("airport_join_key"),
-                 col("date_str").alias("airport_date_str")] + 
-                [col(c) for c in airport_feature_cols]
-            )
+            # Create Spark DataFrame once and cache it
+            if self._airport_spark_features is None:
+                airport_spark = self._spark.createDataFrame(self.airport_features)
+                # Select only feature columns (exclude join keys to avoid ambiguity)
+                airport_feature_cols = [c for c in airport_spark.columns if c not in ['ds', 'date_str', 'origin']]
+                # Rename join keys to avoid ambiguity, keep feature column names as-is
+                self._airport_spark_features = airport_spark.select(
+                    [col("origin").alias("airport_join_key"),
+                     col("date_str").alias("airport_date_str")] + 
+                    [col(c) for c in airport_feature_cols]
+                ).cache()  # Cache to avoid recomputation (materialized on first use)
             
             df_with_features = df_with_features.join(
-                airport_spark_features,
+                self._airport_spark_features,
                 (col(self.origin_col) == col("airport_join_key")) & 
                 (col(self.date_col) == col("airport_date_str")),
                 "left"
