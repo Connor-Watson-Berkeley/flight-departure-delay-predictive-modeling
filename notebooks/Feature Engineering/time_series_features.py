@@ -24,99 +24,205 @@ class TimeSeriesFeaturesModel(Model):
     """Model returned by TimeSeriesFeaturesEstimator after fitting"""
     
     def __init__(self, 
-                 global_features=None,
-                 carrier_features=None,
-                 airport_features=None,
+                 global_model=None,
+                 carrier_models=None,
+                 airport_models=None,
+                 global_training_dates=None,
+                 carrier_training_dates=None,
+                 airport_training_dates=None,
                  date_col="FL_DATE",
                  carrier_col="op_carrier",
-                 origin_col="origin"):
+                 origin_col="origin",
+                 min_days_required=14):
         super(TimeSeriesFeaturesModel, self).__init__()
-        self.global_features = global_features
-        self.carrier_features = carrier_features
-        self.airport_features = airport_features
+        self.global_model = global_model  # Fitted Prophet model
+        self.carrier_models = carrier_models  # Dict: {carrier: fitted Prophet model}
+        self.airport_models = airport_models  # Dict: {airport: fitted Prophet model}
+        self.global_training_dates = global_training_dates  # pd.Series of training dates
+        self.carrier_training_dates = carrier_training_dates  # Dict: {carrier: pd.Series}
+        self.airport_training_dates = airport_training_dates  # Dict: {airport: pd.Series}
         self.date_col = date_col
         self.carrier_col = carrier_col
         self.origin_col = origin_col
+        self.min_days_required = min_days_required
         self._spark = SparkSession.builder.getOrCreate()
+    
+    def _generate_forecasts_for_dates(self, model, training_dates, target_dates):
+        """Generate Prophet forecasts for target dates using a fitted model"""
+        if model is None:
+            return None
         
-        # Cache Spark DataFrames to avoid recreating them on every transform
-        self._global_spark_features = None
-        self._carrier_spark_features = None
-        self._airport_spark_features = None
+        # Combine training and target dates, get unique sorted dates
+        if training_dates is not None and len(training_dates) > 0:
+            all_dates = pd.concat([training_dates, target_dates]).drop_duplicates().sort_values()
+        else:
+            all_dates = target_dates.drop_duplicates().sort_values()
+        
+        # Generate forecast for all dates
+        future_df = pd.DataFrame({'ds': all_dates})
+        forecast = model.predict(future_df)
+        
+        # Extract features
+        feature_cols = ['ds', 'trend', 'weekly', 'yhat', 'yhat_lower', 'yhat_upper']
+        if 'yearly' in forecast.columns:
+            feature_cols.insert(2, 'yearly')
+        
+        features = forecast[feature_cols].copy()
+        features['date_str'] = features['ds'].dt.strftime('%Y-%m-%d')
+        
+        return features
     
     def _transform(self, df):
-        """Join Prophet time-series features to input DataFrame"""
-        if self.global_features is None and self.carrier_features is None and self.airport_features is None:
+        """Generate Prophet forecasts for dates in input DataFrame and join features"""
+        if self.global_model is None and (self.carrier_models is None or len(self.carrier_models) == 0) and (self.airport_models is None or len(self.airport_models) == 0):
             raise ValueError("Model must be fitted before transform()")
         
-        df_with_features = df
+        # Prepare date column and get unique dates from input DataFrame
+        # Ensure date column is in date format for extraction, but keep original for joining
+        df_prep = df.withColumn("date_temp", to_timestamp(col(self.date_col), "yyyy-MM-dd").cast("date"))
+        unique_dates = df_prep.select("date_temp").distinct().orderBy("date_temp").toPandas()['date_temp']
+        unique_dates = pd.to_datetime(unique_dates)
         
-        # Join global features (by date)
-        if self.global_features is not None:
-            # Create Spark DataFrame once and cache it
-            if self._global_spark_features is None:
-                global_spark = self._spark.createDataFrame(self.global_features)
-                # Select only feature columns (exclude join keys to avoid ambiguity)
+        # Ensure date column is formatted as string for joining (yyyy-MM-dd format)
+        df_with_features = df.withColumn(
+            "date_str_join",
+            F.when(
+                col(self.date_col).rlike("^\\d{4}-\\d{2}-\\d{2}$"),
+                col(self.date_col)
+            ).otherwise(
+                F.date_format(to_timestamp(col(self.date_col), "yyyy-MM-dd"), "yyyy-MM-dd")
+            )
+        )
+        
+        # Generate and join global features
+        if self.global_model is not None:
+            global_features = self._generate_forecasts_for_dates(
+                self.global_model, 
+                self.global_training_dates, 
+                unique_dates
+            )
+            
+            if global_features is not None:
+                # Rename columns
+                global_features = global_features.rename(columns={
+                    'trend': 'prophet_trend_global',
+                    'weekly': 'prophet_weekly_seasonality_global',
+                    'yhat': 'prophet_forecast_dep_delay_global',
+                    'yhat_lower': 'prophet_forecast_lower_global',
+                    'yhat_upper': 'prophet_forecast_upper_global'
+                })
+                if 'yearly' in global_features.columns:
+                    global_features = global_features.rename(columns={'yearly': 'prophet_yearly_seasonality_global'})
+                
+                # Convert to Spark DataFrame and join
+                global_spark = self._spark.createDataFrame(global_features)
                 global_feature_cols = [c for c in global_spark.columns if c not in ['ds', 'date_str']]
-                # Rename join key to avoid ambiguity, keep feature column names as-is
-                self._global_spark_features = global_spark.select(
+                global_spark_features = global_spark.select(
                     [col("date_str").alias("global_date_str")] + 
                     [col(c) for c in global_feature_cols]
-                ).cache()  # Cache to avoid recomputation (materialized on first use)
-            
-            # Broadcast the small lookup table for faster joins
-            df_with_features = df_with_features.join(
-                broadcast(self._global_spark_features),
-                col(self.date_col) == col("global_date_str"),
-                "left"
-            ).drop("global_date_str")  # Drop the join key after joining
+                )
+                
+                df_with_features = df_with_features.join(
+                    broadcast(global_spark_features),
+                    col("date_str_join") == col("global_date_str"),
+                    "left"
+                ).drop("global_date_str")
         
-        # Join carrier features (by carrier and date)
-        if self.carrier_features is not None:
-            # Create Spark DataFrame once and cache it
-            if self._carrier_spark_features is None:
-                carrier_spark = self._spark.createDataFrame(self.carrier_features)
-                # Select only feature columns (exclude join keys to avoid ambiguity)
+        # Generate and join carrier features
+        if self.carrier_models is not None and len(self.carrier_models) > 0:
+            # Get unique carriers from input DataFrame
+            unique_carriers = df_with_features.select(self.carrier_col).distinct().filter(col(self.carrier_col).isNotNull()).toPandas()[self.carrier_col].unique()
+            
+            carrier_features_list = []
+            for carrier in unique_carriers:
+                if carrier in self.carrier_models:
+                    training_dates = None
+                    if self.carrier_training_dates is not None:
+                        training_dates = self.carrier_training_dates.get(carrier, pd.Series(dtype='datetime64[ns]'))
+                    carrier_features = self._generate_forecasts_for_dates(
+                        self.carrier_models[carrier],
+                        training_dates,
+                        unique_dates
+                    )
+                    
+                    if carrier_features is not None:
+                        carrier_features = carrier_features.rename(columns={
+                            'trend': 'prophet_trend_carrier',
+                            'weekly': 'prophet_weekly_seasonality_carrier',
+                            'yhat': 'prophet_forecast_dep_delay_carrier',
+                            'yhat_lower': 'prophet_forecast_lower_carrier',
+                            'yhat_upper': 'prophet_forecast_upper_carrier'
+                        })
+                        if 'yearly' in carrier_features.columns:
+                            carrier_features = carrier_features.rename(columns={'yearly': 'prophet_yearly_seasonality_carrier'})
+                        carrier_features['carrier'] = carrier
+                        carrier_features_list.append(carrier_features)
+            
+            if carrier_features_list:
+                carrier_features_df = pd.concat(carrier_features_list, ignore_index=True)
+                carrier_spark = self._spark.createDataFrame(carrier_features_df)
                 carrier_feature_cols = [c for c in carrier_spark.columns if c not in ['ds', 'date_str', 'carrier']]
-                # Rename join keys to avoid ambiguity, keep feature column names as-is
-                self._carrier_spark_features = carrier_spark.select(
+                carrier_spark_features = carrier_spark.select(
                     [col("carrier").alias("carrier_join_key"),
                      col("date_str").alias("carrier_date_str")] + 
                     [col(c) for c in carrier_feature_cols]
-                ).cache()  # Cache to avoid recomputation (materialized on first use)
-            
-            # Broadcast the small lookup table for faster joins
-            df_with_features = df_with_features.join(
-                broadcast(self._carrier_spark_features),
-                (col(self.carrier_col) == col("carrier_join_key")) & 
-                (col(self.date_col) == col("carrier_date_str")),
-                "left"
-            ).drop("carrier_join_key", "carrier_date_str")  # Drop join keys after joining
+                )
+                
+                df_with_features = df_with_features.join(
+                    broadcast(carrier_spark_features),
+                    (col(self.carrier_col) == col("carrier_join_key")) & 
+                    (col("date_str_join") == col("carrier_date_str")),
+                    "left"
+                ).drop("carrier_join_key", "carrier_date_str")
         
-        # Join airport features (by origin airport and date)
-        if self.airport_features is not None:
-            # Create Spark DataFrame once and cache it
-            if self._airport_spark_features is None:
-                airport_spark = self._spark.createDataFrame(self.airport_features)
-                # Select only feature columns (exclude join keys to avoid ambiguity)
+        # Generate and join airport features
+        if self.airport_models is not None and len(self.airport_models) > 0:
+            # Get unique airports from input DataFrame
+            unique_airports = df_with_features.select(self.origin_col).distinct().filter(col(self.origin_col).isNotNull()).toPandas()[self.origin_col].unique()
+            
+            airport_features_list = []
+            for airport in unique_airports:
+                if airport in self.airport_models:
+                    training_dates = None
+                    if self.airport_training_dates is not None:
+                        training_dates = self.airport_training_dates.get(airport, pd.Series(dtype='datetime64[ns]'))
+                    airport_features = self._generate_forecasts_for_dates(
+                        self.airport_models[airport],
+                        training_dates,
+                        unique_dates
+                    )
+                    
+                    if airport_features is not None:
+                        airport_features = airport_features.rename(columns={
+                            'trend': 'prophet_trend_airport',
+                            'weekly': 'prophet_weekly_seasonality_airport',
+                            'yhat': 'prophet_forecast_dep_delay_airport',
+                            'yhat_lower': 'prophet_forecast_lower_airport',
+                            'yhat_upper': 'prophet_forecast_upper_airport'
+                        })
+                        if 'yearly' in airport_features.columns:
+                            airport_features = airport_features.rename(columns={'yearly': 'prophet_yearly_seasonality_airport'})
+                        airport_features['origin'] = airport
+                        airport_features_list.append(airport_features)
+            
+            if airport_features_list:
+                airport_features_df = pd.concat(airport_features_list, ignore_index=True)
+                airport_spark = self._spark.createDataFrame(airport_features_df)
                 airport_feature_cols = [c for c in airport_spark.columns if c not in ['ds', 'date_str', 'origin']]
-                # Rename join keys to avoid ambiguity, keep feature column names as-is
-                self._airport_spark_features = airport_spark.select(
+                airport_spark_features = airport_spark.select(
                     [col("origin").alias("airport_join_key"),
                      col("date_str").alias("airport_date_str")] + 
                     [col(c) for c in airport_feature_cols]
-                ).cache()  # Cache to avoid recomputation (materialized on first use)
-            
-            # Broadcast the small lookup table for faster joins
-            df_with_features = df_with_features.join(
-                broadcast(self._airport_spark_features),
-                (col(self.origin_col) == col("airport_join_key")) & 
-                (col(self.date_col) == col("airport_date_str")),
-                "left"
-            ).drop("airport_join_key", "airport_date_str")  # Drop join keys after joining
+                )
+                
+                df_with_features = df_with_features.join(
+                    broadcast(airport_spark_features),
+                    (col(self.origin_col) == col("airport_join_key")) & 
+                    (col("date_str_join") == col("airport_date_str")),
+                    "left"
+                ).drop("airport_join_key", "airport_date_str")
         
         # Ensure all expected Prophet columns exist (create with NULL if missing)
-        # This prevents imputer from failing if some features weren't generated
         expected_prophet_cols = [
             'prophet_forecast_dep_delay_global', 'prophet_trend_global', 
             'prophet_weekly_seasonality_global', 'prophet_yearly_seasonality_global',
@@ -130,12 +236,14 @@ class TimeSeriesFeaturesModel(Model):
             if col_name not in df_with_features.columns:
                 df_with_features = df_with_features.withColumn(col_name, F.lit(None).cast('double'))
         
-        # Fill NULL values with 0 for Prophet forecast columns in a single pass
+        # Fill NULL values with 0 for Prophet forecast columns
         prophet_cols = [c for c in df_with_features.columns if 'prophet' in c.lower()]
         if prophet_cols:
-            # Use a single fillna call with a dictionary instead of a loop
             fill_dict = {col_name: 0.0 for col_name in prophet_cols}
             df_with_features = df_with_features.fillna(fill_dict)
+        
+        # Drop temporary date_str_join column
+        df_with_features = df_with_features.drop("date_str_join")
         
         return df_with_features
 
@@ -178,10 +286,10 @@ class TimeSeriesFeaturesEstimator(Estimator):
         - y_col: name of the target column
         
         Returns:
-        - Forecast DataFrame (or None if insufficient data)
+        - Tuple of (fitted Prophet model, training dates as pd.Series) or (None, None) if insufficient data
         """
         if len(data) < self.min_days_required:
-            return None
+            return None, None
         
         # Prepare data for Prophet
         prophet_data = data[['ds', y_col]].copy()
@@ -189,7 +297,7 @@ class TimeSeriesFeaturesEstimator(Estimator):
         prophet_data = prophet_data.dropna()
         
         if len(prophet_data) < self.min_days_required:
-            return None
+            return None, None
         
         # Determine seasonality based on data availability
         has_enough_for_yearly = len(prophet_data) >= 365
@@ -206,10 +314,9 @@ class TimeSeriesFeaturesEstimator(Estimator):
         )
         prophet_model.fit(prophet_data)
         
-        # Generate forecast
-        forecast = prophet_model.predict(prophet_data[['ds']])
-        
-        return forecast
+        # Return the fitted model and training dates
+        training_dates = prophet_data['ds'].copy()
+        return prophet_model, training_dates
     
     def _fit(self, df):
         """Generate time-series aggregations and fit Prophet models"""
@@ -226,9 +333,12 @@ class TimeSeriesFeaturesEstimator(Estimator):
             col(self.delay_col).isNotNull()
         )
         
-        global_features = None
-        carrier_features = None
-        airport_features = None
+        global_model = None
+        global_training_dates = None
+        carrier_models = {}
+        carrier_training_dates = {}
+        airport_models = {}
+        airport_training_dates = {}
         
         # 1. Global time-series aggregation
         print("  Generating global time-series...")
@@ -247,28 +357,10 @@ class TimeSeriesFeaturesEstimator(Estimator):
             global_ts['ds'] = pd.to_datetime(global_ts['date'])
             
             # Fit Prophet model
-            forecast_global = self._fit_prophet_model(global_ts, 'avg_dep_delay')
+            global_model, global_training_dates = self._fit_prophet_model(global_ts, 'avg_dep_delay')
             
-            if forecast_global is not None:
-                # Extract features
-                feature_cols = ['ds', 'trend', 'weekly', 'yhat', 'yhat_lower', 'yhat_upper']
-                if 'yearly' in forecast_global.columns:
-                    feature_cols.insert(2, 'yearly')
-                
-                global_features = forecast_global[feature_cols].copy()
-                global_features = global_features.rename(columns={
-                    'trend': 'prophet_trend_global',
-                    'weekly': 'prophet_weekly_seasonality_global',
-                    'yhat': 'prophet_forecast_dep_delay_global',
-                    'yhat_lower': 'prophet_forecast_lower_global',
-                    'yhat_upper': 'prophet_forecast_upper_global'
-                })
-                if 'yearly' in global_features.columns:
-                    global_features = global_features.rename(columns={
-                        'yearly': 'prophet_yearly_seasonality_global'
-                    })
-                global_features['date_str'] = global_features['ds'].dt.strftime('%Y-%m-%d')
-                print(f"    ✓ Generated global Prophet features for {len(global_features)} dates")
+            if global_model is not None:
+                print(f"    ✓ Fitted global Prophet model on {len(global_training_dates)} training dates")
         
         # 2. Carrier time-series aggregation
         if self.carrier_col in df_prep.columns:
@@ -296,35 +388,16 @@ class TimeSeriesFeaturesEstimator(Estimator):
                 
                 print(f"    Fitting Prophet models for {len(carriers_with_sufficient_data)} carriers...")
                 
-                carrier_features_list = []
                 for carrier in carriers_with_sufficient_data:
                     carrier_data = carrier_ts[carrier_ts[self.carrier_col] == carrier].sort_values('ds')
-                    forecast = self._fit_prophet_model(carrier_data, 'avg_dep_delay')
+                    carrier_model, carrier_training_dates_series = self._fit_prophet_model(carrier_data, 'avg_dep_delay')
                     
-                    if forecast is not None:
-                        feature_cols = ['ds', 'trend', 'weekly', 'yhat', 'yhat_lower', 'yhat_upper']
-                        if 'yearly' in forecast.columns:
-                            feature_cols.insert(2, 'yearly')
-                        
-                        features = forecast[feature_cols].copy()
-                        features['carrier'] = carrier
-                        features = features.rename(columns={
-                            'trend': 'prophet_trend_carrier',
-                            'weekly': 'prophet_weekly_seasonality_carrier',
-                            'yhat': 'prophet_forecast_dep_delay_carrier',
-                            'yhat_lower': 'prophet_forecast_lower_carrier',
-                            'yhat_upper': 'prophet_forecast_upper_carrier'
-                        })
-                        if 'yearly' in features.columns:
-                            features = features.rename(columns={
-                                'yearly': 'prophet_yearly_seasonality_carrier'
-                            })
-                        features['date_str'] = features['ds'].dt.strftime('%Y-%m-%d')
-                        carrier_features_list.append(features)
+                    if carrier_model is not None:
+                        carrier_models[carrier] = carrier_model
+                        carrier_training_dates[carrier] = carrier_training_dates_series
                 
-                if carrier_features_list:
-                    carrier_features = pd.concat(carrier_features_list, ignore_index=True)
-                    print(f"    ✓ Generated carrier Prophet features for {carrier_features['carrier'].nunique()} carriers")
+                if carrier_models:
+                    print(f"    ✓ Fitted Prophet models for {len(carrier_models)} carriers")
         
         # 3. Airport time-series aggregation
         if self.origin_col in df_prep.columns:
@@ -359,47 +432,32 @@ class TimeSeriesFeaturesEstimator(Estimator):
                 
                 print(f"    Fitting Prophet models for {len(top_airports)} airports...")
                 
-                airport_features_list = []
                 for airport in top_airports:
                     airport_data = airport_ts[airport_ts[self.origin_col] == airport].sort_values('ds')
-                    forecast = self._fit_prophet_model(airport_data, 'avg_dep_delay')
+                    airport_model, airport_training_dates_series = self._fit_prophet_model(airport_data, 'avg_dep_delay')
                     
-                    if forecast is not None:
-                        feature_cols = ['ds', 'trend', 'weekly', 'yhat', 'yhat_lower', 'yhat_upper']
-                        if 'yearly' in forecast.columns:
-                            feature_cols.insert(2, 'yearly')
-                        
-                        features = forecast[feature_cols].copy()
-                        features['origin'] = airport
-                        features = features.rename(columns={
-                            'trend': 'prophet_trend_airport',
-                            'weekly': 'prophet_weekly_seasonality_airport',
-                            'yhat': 'prophet_forecast_dep_delay_airport',
-                            'yhat_lower': 'prophet_forecast_lower_airport',
-                            'yhat_upper': 'prophet_forecast_upper_airport'
-                        })
-                        if 'yearly' in features.columns:
-                            features = features.rename(columns={
-                                'yearly': 'prophet_yearly_seasonality_airport'
-                            })
-                        features['date_str'] = features['ds'].dt.strftime('%Y-%m-%d')
-                        airport_features_list.append(features)
+                    if airport_model is not None:
+                        airport_models[airport] = airport_model
+                        airport_training_dates[airport] = airport_training_dates_series
                 
-                if airport_features_list:
-                    airport_features = pd.concat(airport_features_list, ignore_index=True)
-                    print(f"    ✓ Generated airport Prophet features for {airport_features['origin'].nunique()} airports")
+                if airport_models:
+                    print(f"    ✓ Fitted Prophet models for {len(airport_models)} airports")
         
         end_time = datetime.now()
         duration = end_time - start_time
         timestamp = end_time.strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{timestamp}] ✓ Time-series feature generation complete! (took {duration})")
         
-        # Return a Model instance
+        # Return a Model instance with fitted Prophet models
         return TimeSeriesFeaturesModel(
-            global_features=global_features,
-            carrier_features=carrier_features,
-            airport_features=airport_features,
+            global_model=global_model,
+            carrier_models=carrier_models if carrier_models else None,
+            airport_models=airport_models if airport_models else None,
+            global_training_dates=global_training_dates,
+            carrier_training_dates=carrier_training_dates if carrier_training_dates else None,
+            airport_training_dates=airport_training_dates if airport_training_dates else None,
             date_col=self.date_col,
             carrier_col=self.carrier_col,
-            origin_col=self.origin_col
+            origin_col=self.origin_col,
+            min_days_required=self.min_days_required
         )
