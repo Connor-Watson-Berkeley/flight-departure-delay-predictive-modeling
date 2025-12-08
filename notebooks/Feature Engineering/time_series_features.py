@@ -12,9 +12,10 @@ from pyspark.ml.base import Estimator, Model
 import pandas as pd
 from datetime import datetime
 
-# Suppress verbose cmdstanpy output BEFORE importing Prophet
+# Suppress verbose cmdstanpy and prophet output BEFORE importing Prophet
 import logging
 logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
+logging.getLogger('prophet').setLevel(logging.ERROR)
 
 from prophet import Prophet
 

@@ -170,7 +170,10 @@ class GraphFeaturesEstimator(Estimator):
         )
         
         pagerank_scores = pr_unw.join(pr_w, "airport", "outer")
-        
+
+        # Cache the PageRank scores since they'll be used multiple times in transform (origin + dest joins)
+        pagerank_scores = pagerank_scores.cache()
+
         end_time = datetime.now()
         duration = end_time - start_time
         timestamp = end_time.strftime("%Y-%m-%d %H:%M:%S")
