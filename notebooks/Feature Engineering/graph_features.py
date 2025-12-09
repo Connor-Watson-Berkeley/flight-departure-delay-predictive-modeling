@@ -6,7 +6,7 @@ Computes PageRank features (weighted and unweighted) from flight network graph.
 """
 
 from pyspark.sql import SparkSession, functions as F
-from pyspark.sql.functions import col
+from pyspark.sql.functions import col, broadcast
 from pyspark.ml.base import Estimator, Model
 from graphframes import GraphFrame
 from datetime import datetime
@@ -22,15 +22,24 @@ class GraphFeaturesModel(Model):
         self.dest_col = dest_col
     
     def _transform(self, df):
-        """Join PageRank scores to input DataFrame"""
+        """Join PageRank scores to input DataFrame
+        
+        Optimizations:
+        - Broadcasts PageRank scores (small lookup table ~200 airports) for faster joins
+        - PageRank scores are already cached from fit() for reuse across multiple transforms
+        """
         if self.pagerank_scores is None:
             raise ValueError("Model must be fitted before transform()")
+        
+        # Broadcast PageRank scores for efficient joins (small lookup table ~200 airports)
+        # This avoids shuffling the large DataFrame and speeds up joins significantly
+        broadcast_scores = broadcast(self.pagerank_scores)
         
         # Join PageRank scores for origin and destination airports
         df_with_features = (
             df
             .join(
-                self.pagerank_scores,
+                broadcast_scores,
                 col(self.origin_col) == col("airport"),
                 "left"
             )
@@ -38,7 +47,7 @@ class GraphFeaturesModel(Model):
             .withColumnRenamed("pagerank_unweighted", "origin_pagerank_unweighted")
             .drop("airport")
             .join(
-                self.pagerank_scores,
+                broadcast_scores,
                 col(self.dest_col) == col("airport"),
                 "left"
             )
@@ -56,7 +65,7 @@ class GraphFeaturesModel(Model):
             df_with_features = (
                 df_with_features
                 .join(
-                    self.pagerank_scores,
+                    broadcast_scores,
                     col("prev_flight_origin") == col("airport"),
                     "left"
                 )
@@ -71,7 +80,7 @@ class GraphFeaturesModel(Model):
             df_with_features = (
                 df_with_features
                 .join(
-                    self.pagerank_scores,
+                    broadcast_scores,
                     col("prev_flight_dest") == col("airport"),
                     "left"
                 )
@@ -105,8 +114,9 @@ class GraphFeaturesModel(Model):
                 "prev_flight_dest_pagerank_unweighted"
             ])
         
-        for col_name in pagerank_cols:
-            df_with_features = df_with_features.fillna({col_name: 0.0})
+        # Fill all NULL PageRank values in a single operation (more efficient than loop)
+        fill_dict = {col_name: 0.0 for col_name in pagerank_cols}
+        df_with_features = df_with_features.fillna(fill_dict)
         
         return df_with_features
 
