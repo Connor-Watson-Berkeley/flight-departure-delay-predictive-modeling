@@ -28,7 +28,8 @@ def add_precomputed_features(train_df: DataFrame, val_df: DataFrame,
                              model_ids: list[str] = None,
                              compute_graph: bool = True,
                              compute_meta_models: bool = True,
-                             verbose: bool = True) -> tuple[DataFrame, DataFrame]:
+                             verbose: bool = True,
+                             warm_start_scores: dict = None) -> tuple[DataFrame, DataFrame, dict]:
     """
     Add precomputed graph features and meta-model predictions to train and val DataFrames.
     
@@ -48,33 +49,48 @@ def add_precomputed_features(train_df: DataFrame, val_df: DataFrame,
         verbose: Whether to print progress messages
     
     Returns:
-        tuple: (train_df_with_features, val_df_with_features)
+        tuple: (train_df_with_features, val_df_with_features, pagerank_scores_dict)
+               pagerank_scores_dict is {airport: {weighted: score, unweighted: score}} for warm start
+               Returns None for pagerank_scores_dict if compute_graph=False
     
     Example:
         # Single model
-        train_df, val_df = add_precomputed_features(train_df, val_df, model_ids=["RF_1"])
+        train_df, val_df, scores = add_precomputed_features(train_df, val_df, model_ids=["RF_1"])
         
-        # Multiple models
-        train_df, val_df = add_precomputed_features(train_df, val_df, model_ids=["RF_1", "RF_2"])
+        # Multiple models with warm start
+        train_df, val_df, scores = add_precomputed_features(
+            train_df, val_df, 
+            model_ids=["RF_1", "RF_2"],
+            warm_start_scores=previous_fold_scores
+        )
     """
     if model_ids is None:
         model_ids = ["RF_1"]
     
     train_result = train_df
     val_result = val_df
+    pagerank_scores_dict = None
     
     # Compute graph features
     if compute_graph:
-        train_result, val_result = graph_features.compute_pagerank_features(
-            train_result, val_result, verbose=verbose
+        train_result, val_result, pagerank_scores_dict = graph_features.compute_pagerank_features(
+            train_result, val_result, verbose=verbose, warm_start_scores=warm_start_scores
         )
     
     # Compute meta-model predictions
     if compute_meta_models:
         # Compute predictions for each model
+        # Use raw features (use_preprocessed_features=False) since we're precomputing before pipeline preprocessing
         for model_id in model_ids:
-            train_result, val_result = meta_model_estimator.compute_meta_model_predictions(
-                train_result, val_result, model_id=model_id, verbose=verbose
-            )
+            try:
+                train_result, val_result = meta_model_estimator.compute_meta_model_predictions(
+                    train_result, val_result, model_id=model_id, verbose=verbose, use_preprocessed_features=False
+                )
+            except Exception as e:
+                if verbose:
+                    print(f"  ⚠ ERROR: Meta-model {model_id} failed: {str(e)}")
+                    print(f"  This may be due to resource constraints or missing features.")
+                raise RuntimeError(f"Meta-model precomputation failed for {model_id}. Error: {str(e)}") from e
     
-    return train_result, val_result
+    return train_result, val_result, pagerank_scores_dict
+

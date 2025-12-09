@@ -145,15 +145,33 @@ def create_sliding_window_folds(
             (F.col(date_col) >= F.lit(v_start.strftime("%Y-%m-%d"))) &
             (F.col(date_col) <  F.lit(v_end.strftime("%Y-%m-%d")))
         )
-
+        
+        # CRITICAL: Cache filtered DataFrames before adding features
+        # This prevents recomputing the lineage join chain on every operation
+        # The filter operation creates a new DataFrame, so we need to cache it
+        train_df = train_df.cache()
+        val_df = val_df.cache()
+        
         # Add precomputed features (graph + meta-models) if enabled
+        # Use warm start: previous fold's PageRank scores to speed up convergence
+        warm_start_scores = None
         if PRECOMPUTE_GRAPH_FEATURES or PRECOMPUTE_META_MODELS:
-            train_df, val_df = precompute_features.add_precomputed_features(
+            if verbose:
+                # Trigger cache materialization and get counts for logging (single count, not double)
+                train_count = train_df.count()
+                val_count = val_df.count()
+                print(f"\n{'='*60}")
+                print(f"Computing engineered features for {version} Fold {f+1}")
+                print(f"  Train: [{t_start:%Y-%m-%d} to {t_end:%Y-%m-%d}), {train_count:,} rows")
+                print(f"  Val:   [{v_start:%Y-%m-%d} to {v_end:%Y-%m-%d}), {val_count:,} rows")
+                print(f"{'='*60}")
+            train_df, val_df, warm_start_scores = precompute_features.add_precomputed_features(
                 train_df, val_df,
                 model_ids=META_MODEL_IDS,
                 compute_graph=PRECOMPUTE_GRAPH_FEATURES,
                 compute_meta_models=PRECOMPUTE_META_MODELS,
-                verbose=verbose
+                verbose=verbose,
+                warm_start_scores=warm_start_scores  # Use previous fold's scores (None for first fold)
             )
         
         folds.append((train_df, val_df))
@@ -177,15 +195,31 @@ def create_sliding_window_folds(
             (F.col(date_col) >= F.lit(test_start.strftime("%Y-%m-%d"))) &
             (F.col(date_col) <= F.lit(test_end.strftime("%Y-%m-%d")))
         )
+        
+        # CRITICAL: Cache filtered DataFrames before adding features
+        # This prevents recomputing the lineage join chain on every operation
+        combined_train = combined_train.cache()
+        test_df = test_df.cache()
 
         # Add precomputed features (graph + meta-models) if enabled
+        # Use warm start from last CV fold (or None if no CV folds)
         if PRECOMPUTE_GRAPH_FEATURES or PRECOMPUTE_META_MODELS:
-            combined_train, test_df = precompute_features.add_precomputed_features(
+            if verbose:
+                # Trigger cache materialization and get counts for logging (single count, not double)
+                train_count = combined_train.count()
+                test_count = test_df.count()
+                print(f"\n{'='*60}")
+                print(f"Computing engineered features for {version} Test Fold")
+                print(f"  Train: [{start_date} to {test_start:%Y-%m-%d}), {train_count:,} rows")
+                print(f"  Test:  [{test_start:%Y-%m-%d} to {test_end:%Y-%m-%d}), {test_count:,} rows")
+                print(f"{'='*60}")
+            combined_train, test_df, _ = precompute_features.add_precomputed_features(
                 combined_train, test_df,
                 model_ids=META_MODEL_IDS,
                 compute_graph=PRECOMPUTE_GRAPH_FEATURES,
                 compute_meta_models=PRECOMPUTE_META_MODELS,
-                verbose=verbose
+                verbose=verbose,
+                warm_start_scores=warm_start_scores  # Use last CV fold's scores
             )
         
         folds.append((combined_train, test_df))
@@ -218,6 +252,13 @@ def save_folds_to_parquet(folds, version: str):
         else:
             test_name = f"OTPW_{SOURCE}_{version}_FOLD_{i}_TEST"
             val_df.write.mode(WRITE_MODE).parquet(f"{OUTPUT_FOLDER}/{test_name}.parquet")
+        
+        # Cleanup: Unpersist cached DataFrames after writing to disk to free memory
+        # This prevents memory buildup when processing multiple folds
+        if train_df.is_cached:
+            train_df.unpersist()
+        if val_df.is_cached:
+            val_df.unpersist()
 
 
 # -------------------------
@@ -234,9 +275,17 @@ if __name__ == "__main__":
 
         # Joins in flight lineage features
         df = flight_lineage_features.add_flight_lineage_features(df)
+        
+        # CRITICAL: Cache the lineage features to avoid recomputing the entire join chain
+        # The lineage join involves many window functions and LAG operations - very expensive to recompute
+        # Without caching, every operation on train_df/val_df would recompute the entire lineage join
+        df = df.cache()
+        cached_count = df.count()  # Trigger cache materialization
+        if VERBOSE:
+            print(f"✓ Cached flight lineage features ({cached_count:,} rows)")
 
         folds = create_sliding_window_folds(
-            df=df,
+            df=df, 
             date_col=DATE_COL,
             n_folds=N_FOLDS,
             test_fold=CREATE_TEST_FOLD,
@@ -245,6 +294,12 @@ if __name__ == "__main__":
 
         print(f"💾 Writing {len(folds)} folds for {version} to {OUTPUT_FOLDER}")
         save_folds_to_parquet(folds, version)
+        
+        # Unpersist full dataset cache after all folds are written (free memory)
+        if df.is_cached:
+            df.unpersist()
+            if VERBOSE:
+                print(f"✓ Unpersisted cached lineage features for {version}")
 
         print(f"✅ Done writing {version} folds.")
     

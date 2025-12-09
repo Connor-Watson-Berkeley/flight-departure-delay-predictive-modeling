@@ -34,6 +34,13 @@ META_MODEL_IDS = {
         "max_depth": 20,
         "min_instances_per_node": 20,
         "use_preprocessed_features": True
+    },
+    "RF_1_FAST": {
+        "description": "Random Forest v1 Fast (20 trees, max_depth=10, min_instances_per_node=20) - for precomputation",
+        "num_trees": 20,
+        "max_depth": 10,
+        "min_instances_per_node": 20,
+        "use_preprocessed_features": False
     }
 }
 
@@ -303,10 +310,71 @@ class MetaModelEstimator(Estimator):
         normal_count = total_count - first_flight_count - jump_count
         print(f"  Training on {total_count:,} rows ({normal_count:,} rotations, {first_flight_count:,} first flights, {jump_count:,} jumps)")
         
-        # Train meta-models
-        air_time_pipeline = self._train_air_time_model(train_with_prev)
-        taxi_time_pipeline = self._train_taxi_time_model(train_with_prev)
-        total_duration_pipeline = self._train_total_duration_model(train_with_prev)
+        # OPTIMIZATION: If using raw features, preprocess once and cache to avoid repeating expensive operations
+        # (StringIndexer, OneHotEncoder) for each meta-model
+        # NOTE: StringIndexer.fit() is inherently slow on high-cardinality categoricals (200+ airports)
+        # This is a one-time cost per fold - subsequent models reuse the cached preprocessed DataFrame
+        preprocessed_df = None
+        if not self.use_preprocessed_features:
+            # Collect all features used by all meta-models
+            all_categorical = set()
+            all_numerical = set()
+            for target in ["air_time", "taxi_time", "total_duration"]:
+                cat, num = self._get_meta_model_features(train_with_prev, target)
+                all_categorical.update(cat)
+                all_numerical.update(num)
+            
+            # CV-SAFE: Preprocess once on training data only (fit on train, will be applied to val later)
+            # Imputer and StringIndexer are fit on train_with_prev (training data only)
+            # This ensures no data leakage - imputation means and index mappings come from training data only
+            stages = []
+            if all_numerical:
+                imputer = Imputer(
+                    inputCols=list(all_numerical),
+                    outputCols=[f"{col}_IMPUTED" for col in all_numerical],
+                    strategy="mean"
+                )
+                stages.append(imputer)
+            
+            if all_categorical:
+                # StringIndexer: fit on training data only (CV-safe)
+                # Index mappings (e.g., airport codes -> 0, 1, 2...) are learned from training data
+                indexer = StringIndexer(
+                    inputCols=list(all_categorical),
+                    outputCols=[f"{col}_INDEX" for col in all_categorical],
+                    handleInvalid="keep"  # Unknown categories in val/test get index 0
+                )
+                stages.append(indexer)
+                encoder = OneHotEncoder(
+                    inputCols=[f"{col}_INDEX" for col in all_categorical],
+                    outputCols=[f"{col}_VEC" for col in all_categorical],
+                    dropLast=False
+                )
+                stages.append(encoder)
+            
+            if stages:
+                from pyspark.ml import Pipeline as MLPipeline
+                # OPTIMIZATION: Cache input DataFrame before fit/transform to speed up StringIndexer
+                # StringIndexer needs to scan data to build index - caching helps
+                train_with_prev_cached = train_with_prev.cache()
+                _ = train_with_prev_cached.count()  # Trigger cache
+                
+                preprocess_pipeline = MLPipeline(stages=stages)
+                # Fit on training data only (CV-safe)
+                fitted_preprocessor = preprocess_pipeline.fit(train_with_prev_cached)
+                # Transform training data
+                preprocessed_df = fitted_preprocessor.transform(train_with_prev_cached).cache()
+                # Trigger cache materialization
+                _ = preprocessed_df.count()
+                print(f"  ✓ Preprocessed {len(all_categorical)} categorical and {len(all_numerical)} numerical features (cached)")
+                
+                # Unpersist input cache to free memory
+                train_with_prev_cached.unpersist()
+        
+        # Train meta-models (pass preprocessed_df if available)
+        air_time_pipeline = self._train_air_time_model(train_with_prev, preprocessed_df=preprocessed_df)
+        taxi_time_pipeline = self._train_taxi_time_model(train_with_prev, preprocessed_df=preprocessed_df)
+        total_duration_pipeline = self._train_total_duration_model(train_with_prev, preprocessed_df=preprocessed_df)
         
         # Debug: Count how many actually trained
         trained_count = sum([
@@ -707,7 +775,7 @@ class MetaModelEstimator(Estimator):
         
         return Pipeline(stages=stages)
     
-    def _train_air_time_model(self, train_df):
+    def _train_air_time_model(self, train_df, preprocessed_df=None):
         """Train meta-model to predict prev_flight_air_time."""
         print("  Training meta-model: prev_flight_air_time", end="")
         
@@ -731,12 +799,20 @@ class MetaModelEstimator(Estimator):
         
         print(f" ({count:,} rows, {len(categorical_features)} cat, {len(numerical_features)} num)", end="")
         
+        # Use preprocessed_df if available (optimization: avoid re-preprocessing)
+        processed_df = None
+        if preprocessed_df is not None:
+            # Filter preprocessed_df to match train_air_time rows
+            processed_df = preprocessed_df.filter(col("prev_flight_air_time").isNotNull())
+        elif self.use_preprocessed_features:
+            processed_df = train_air_time
+        
         # Build and fit pipeline
         pipeline = self._build_meta_model_pipeline(
             categorical_features, 
             numerical_features, 
             "prev_flight_air_time",
-            processed_df=train_air_time if self.use_preprocessed_features else None
+            processed_df=processed_df
         )
         
         fitted_pipeline = pipeline.fit(train_air_time)
@@ -744,7 +820,7 @@ class MetaModelEstimator(Estimator):
         
         return fitted_pipeline
     
-    def _train_taxi_time_model(self, train_df):
+    def _train_taxi_time_model(self, train_df, preprocessed_df=None):
         """Train meta-model to predict prev_flight_taxi_time (taxi_in + taxi_out)."""
         print("  Training meta-model: prev_flight_taxi_time", end="")
         
@@ -758,6 +834,16 @@ class MetaModelEstimator(Estimator):
                     col("prev_flight_taxi_out"), lit(0.0)
                 )
             )
+            # Also add to preprocessed_df if available
+            if preprocessed_df is not None:
+                preprocessed_df = preprocessed_df.withColumn(
+                    "prev_flight_taxi_time",
+                    coalesce(
+                        col("prev_flight_taxi_in"), lit(0.0)
+                    ) + coalesce(
+                        col("prev_flight_taxi_out"), lit(0.0)
+                    )
+                )
         
         # Filter to rows with valid target
         train_taxi_time = train_df.filter(col("prev_flight_taxi_time").isNotNull())
@@ -774,12 +860,19 @@ class MetaModelEstimator(Estimator):
         
         print(f" ({count:,} rows, {len(categorical_features)} cat, {len(numerical_features)} num)", end="")
         
+        # Use preprocessed_df if available (optimization: avoid re-preprocessing)
+        processed_df = None
+        if preprocessed_df is not None:
+            processed_df = preprocessed_df.filter(col("prev_flight_taxi_time").isNotNull())
+        elif self.use_preprocessed_features:
+            processed_df = train_taxi_time
+        
         # Build and fit pipeline
         pipeline = self._build_meta_model_pipeline(
             categorical_features, 
             numerical_features, 
             "prev_flight_taxi_time",
-            processed_df=train_taxi_time if self.use_preprocessed_features else None
+            processed_df=processed_df
         )
         
         fitted_pipeline = pipeline.fit(train_taxi_time)
@@ -787,7 +880,7 @@ class MetaModelEstimator(Estimator):
         
         return fitted_pipeline
     
-    def _train_total_duration_model(self, train_df):
+    def _train_total_duration_model(self, train_df, preprocessed_df=None):
         """Train meta-model to predict prev_flight_total_duration (actual_elapsed_time)."""
         print("  Training meta-model: prev_flight_total_duration", end="")
         
@@ -810,6 +903,16 @@ class MetaModelEstimator(Estimator):
             col("prev_flight_actual_elapsed_time")
         )
         
+        # Also add to preprocessed_df if available
+        processed_total_duration = None
+        if preprocessed_df is not None:
+            processed_total_duration = preprocessed_df.filter(
+                col("prev_flight_actual_elapsed_time").isNotNull()
+            ).withColumn(
+                "prev_flight_total_duration",
+                col("prev_flight_actual_elapsed_time")
+            )
+        
         # Get features
         categorical_features, numerical_features = self._get_meta_model_features(
             train_total_duration, "total_duration"
@@ -817,12 +920,15 @@ class MetaModelEstimator(Estimator):
         
         print(f" ({count:,} rows, {len(categorical_features)} cat, {len(numerical_features)} num)", end="")
         
+        # Use preprocessed_df if available (optimization: avoid re-preprocessing)
+        processed_df = processed_total_duration if processed_total_duration is not None else (train_total_duration if self.use_preprocessed_features else None)
+        
         # Build and fit pipeline
         pipeline = self._build_meta_model_pipeline(
             categorical_features, 
             numerical_features, 
             "prev_flight_total_duration",
-            processed_df=train_total_duration if self.use_preprocessed_features else None
+            processed_df=processed_df
         )
         
         fitted_pipeline = pipeline.fit(train_total_duration)
@@ -834,7 +940,7 @@ class MetaModelEstimator(Estimator):
 # -------------------------
 # REUSABLE META-MODEL COMPUTATION FUNCTION
 # -------------------------
-def compute_meta_model_predictions(train_df, val_df, model_id="RF_1", verbose=True):
+def compute_meta_model_predictions(train_df, val_df, model_id="RF_1", verbose=True, use_preprocessed_features=None):
     """
     Train meta-models on training data and apply predictions to both train and val DataFrames.
     
@@ -846,6 +952,10 @@ def compute_meta_model_predictions(train_df, val_df, model_id="RF_1", verbose=Tr
         val_df: Validation/test DataFrame (gets predictions joined)
         model_id: Model identifier (e.g., "RF_1") - must exist in META_MODEL_IDS
         verbose: Whether to print progress messages
+        use_preprocessed_features: Override the model config's use_preprocessed_features setting.
+                                   If None, uses the value from META_MODEL_IDS.
+                                   For precomputation (raw features), set to False.
+                                   For pipeline use (preprocessed features), set to True.
     
     Returns:
         tuple: (train_df_with_predictions, val_df_with_predictions) both with predicted columns:
@@ -858,18 +968,23 @@ def compute_meta_model_predictions(train_df, val_df, model_id="RF_1", verbose=Tr
     
     model_config = META_MODEL_IDS[model_id]
     
+    # Use override if provided, otherwise use config default
+    if use_preprocessed_features is None:
+        use_preprocessed_features = model_config.get("use_preprocessed_features", False)
+    
     if verbose:
         start_time = datetime.now()
         timestamp = start_time.strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{timestamp}] Computing meta-model predictions ({model_id})...")
         print(f"  Config: {model_config['description']}")
+        print(f"  Using {'preprocessed' if use_preprocessed_features else 'raw'} features")
     
     # Create estimator with model config
     estimator = MetaModelEstimator(
         num_trees=model_config["num_trees"],
         max_depth=model_config["max_depth"],
         min_instances_per_node=model_config["min_instances_per_node"],
-        use_preprocessed_features=model_config["use_preprocessed_features"]
+        use_preprocessed_features=use_preprocessed_features
     )
     
     # Train on training data
