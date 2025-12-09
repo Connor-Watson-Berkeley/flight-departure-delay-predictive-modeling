@@ -24,6 +24,7 @@ from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.functions import col
 from pyspark.ml.evaluation import RegressionEvaluator
 import pandas as pd
+import time
 
 
 # -----------------------------
@@ -199,20 +200,47 @@ class FlightDelayEvaluator:
                     precision=precision, recall=recall, f1=f1, accuracy=accuracy)
 
     def calculate_otpa_metrics(self, predictions_df):
+        """Calculate On-Time Prediction Accuracy (OTPA) metrics.
+        
+        Returns:
+            dict: Contains 'accuracy', 'precision', 'recall', 'f1' for 15-minute threshold
+        """
         return self._calculate_classification_metrics(
             predictions_df, threshold=15, label_col=self.binary_label_col
-        )["accuracy"]
+        )
 
     def calculate_sddr_metrics(self, predictions_df):
+        """Calculate Severe Delay Detection Rate (SDDR) metrics.
+        
+        Returns:
+            dict: Contains 'accuracy', 'precision', 'recall', 'f1' for 60-minute threshold
+        """
         return self._calculate_classification_metrics(
             predictions_df, threshold=60, label_col=self.severe_label_col
-        )["recall"]
+        )
 
     def evaluate(self, predictions_df):
+        """Evaluate predictions and return all metrics.
+        
+        Returns:
+            dict: Contains:
+                - "rmse": Root Mean Squared Error
+                - "otpa": On-Time Prediction Accuracy metrics (dict with accuracy, precision, recall, f1)
+                - "sddr": Severe Delay Detection Rate metrics (dict with accuracy, precision, recall, f1)
+        """
+        otpa_metrics = self.calculate_otpa_metrics(predictions_df)
+        sddr_metrics = self.calculate_sddr_metrics(predictions_df)
+        
         return {
             "rmse": self.calculate_rmse(predictions_df),
-            "otpa": self.calculate_otpa_metrics(predictions_df),
-            "sddr": self.calculate_sddr_metrics(predictions_df),
+            "otpa": otpa_metrics["accuracy"],  # Backwards compatibility
+            "otpa_precision": otpa_metrics["precision"],
+            "otpa_recall": otpa_metrics["recall"],
+            "otpa_f1": otpa_metrics["f1"],
+            "sddr": sddr_metrics["recall"],  # Backwards compatibility (SDDR is recall)
+            "sddr_precision": sddr_metrics["precision"],
+            "sddr_recall": sddr_metrics["recall"],
+            "sddr_f1": sddr_metrics["f1"],
         }
 
 
@@ -299,14 +327,26 @@ class FlightDelayCV:
                 'Fold': f"{fold} Train",
                 'rmse': result['rmse_train'],
                 'otpa': result['otpa_train'],
-                'sddr': result['sddr_train']
+                'otpa_precision': result.get('otpa_precision_train', None),
+                'otpa_recall': result.get('otpa_recall_train', None),
+                'otpa_f1': result.get('otpa_f1_train', None),
+                'sddr': result['sddr_train'],
+                'sddr_precision': result.get('sddr_precision_train', None),
+                'sddr_recall': result.get('sddr_recall_train', None),
+                'sddr_f1': result.get('sddr_f1_train', None)
             })
             # Val row
             formatted_results.append({
                 'Fold': f"{fold} Val",
                 'rmse': result['rmse_val'],
                 'otpa': result['otpa_val'],
-                'sddr': result['sddr_val']
+                'otpa_precision': result.get('otpa_precision_val', None),
+                'otpa_recall': result.get('otpa_recall_val', None),
+                'otpa_f1': result.get('otpa_f1_val', None),
+                'sddr': result['sddr_val'],
+                'sddr_precision': result.get('sddr_precision_val', None),
+                'sddr_recall': result.get('sddr_recall_val', None),
+                'sddr_f1': result.get('sddr_f1_val', None)
             })
         
         m = pd.DataFrame(formatted_results)
@@ -319,37 +359,87 @@ class FlightDelayCV:
             'Fold': 'Mean Train',
             'rmse': train_rows['rmse'].mean(),
             'otpa': train_rows['otpa'].mean(),
-            'sddr': train_rows['sddr'].mean()
+            'otpa_precision': train_rows['otpa_precision'].mean() if 'otpa_precision' in train_rows.columns else None,
+            'otpa_recall': train_rows['otpa_recall'].mean() if 'otpa_recall' in train_rows.columns else None,
+            'otpa_f1': train_rows['otpa_f1'].mean() if 'otpa_f1' in train_rows.columns else None,
+            'sddr': train_rows['sddr'].mean(),
+            'sddr_precision': train_rows['sddr_precision'].mean() if 'sddr_precision' in train_rows.columns else None,
+            'sddr_recall': train_rows['sddr_recall'].mean() if 'sddr_recall' in train_rows.columns else None,
+            'sddr_f1': train_rows['sddr_f1'].mean() if 'sddr_f1' in train_rows.columns else None
         }])
         
         std_train = pd.DataFrame([{
             'Fold': 'Std Train',
             'rmse': train_rows['rmse'].std(),
             'otpa': train_rows['otpa'].std(),
-            'sddr': train_rows['sddr'].std()
+            'otpa_precision': train_rows['otpa_precision'].std() if 'otpa_precision' in train_rows.columns else None,
+            'otpa_recall': train_rows['otpa_recall'].std() if 'otpa_recall' in train_rows.columns else None,
+            'otpa_f1': train_rows['otpa_f1'].std() if 'otpa_f1' in train_rows.columns else None,
+            'sddr': train_rows['sddr'].std(),
+            'sddr_precision': train_rows['sddr_precision'].std() if 'sddr_precision' in train_rows.columns else None,
+            'sddr_recall': train_rows['sddr_recall'].std() if 'sddr_recall' in train_rows.columns else None,
+            'sddr_f1': train_rows['sddr_f1'].std() if 'sddr_f1' in train_rows.columns else None
         }])
         
         mean_val = pd.DataFrame([{
             'Fold': 'Mean Val',
             'rmse': val_rows['rmse'].mean(),
             'otpa': val_rows['otpa'].mean(),
-            'sddr': val_rows['sddr'].mean()
+            'otpa_precision': val_rows['otpa_precision'].mean() if 'otpa_precision' in val_rows.columns else None,
+            'otpa_recall': val_rows['otpa_recall'].mean() if 'otpa_recall' in val_rows.columns else None,
+            'otpa_f1': val_rows['otpa_f1'].mean() if 'otpa_f1' in val_rows.columns else None,
+            'sddr': val_rows['sddr'].mean(),
+            'sddr_precision': val_rows['sddr_precision'].mean() if 'sddr_precision' in val_rows.columns else None,
+            'sddr_recall': val_rows['sddr_recall'].mean() if 'sddr_recall' in val_rows.columns else None,
+            'sddr_f1': val_rows['sddr_f1'].mean() if 'sddr_f1' in val_rows.columns else None
         }])
         
         std_val = pd.DataFrame([{
             'Fold': 'Std Val',
             'rmse': val_rows['rmse'].std(),
             'otpa': val_rows['otpa'].std(),
-            'sddr': val_rows['sddr'].std()
+            'otpa_precision': val_rows['otpa_precision'].std() if 'otpa_precision' in val_rows.columns else None,
+            'otpa_recall': val_rows['otpa_recall'].std() if 'otpa_recall' in val_rows.columns else None,
+            'otpa_f1': val_rows['otpa_f1'].std() if 'otpa_f1' in val_rows.columns else None,
+            'sddr': val_rows['sddr'].std(),
+            'sddr_precision': val_rows['sddr_precision'].std() if 'sddr_precision' in val_rows.columns else None,
+            'sddr_recall': val_rows['sddr_recall'].std() if 'sddr_recall' in val_rows.columns else None,
+            'sddr_f1': val_rows['sddr_f1'].std() if 'sddr_f1' in val_rows.columns else None
         }])
         
         m = pd.concat([m, mean_train, std_train, mean_val, std_val], ignore_index=True)
         return m
 
-    def evaluate(self):
-        train_df, test_df = self.folds[-1]
-
-        fold_index = 3  # Test fold is always at index 3 (0-based: folds are 0, 1, 2, 3)
+    def evaluate(self, use_fold_3_val_train=False):
+        """
+        Evaluate model on test set.
+        
+        Args:
+            use_fold_3_val_train (bool): If True, train on fold 3's validation data (2018) instead of all previous data.
+                                         Fold 3 is at index 2 (fold[-2]), and we use its validation portion (2018 data).
+                                         This helps avoid temporal drift when predicting 2019 test set.
+                                         Default: False (backwards compatible - uses all previous data)
+        
+        Returns:
+            pd.DataFrame with Train and Test metrics
+        """
+        if use_fold_3_val_train:
+            # Use fold 3 (index 2, fold[-2]) validation data (2018) to train, and test fold's test data (2019)
+            # Fold 3 is at index 2: self.folds[2] = (train_df, val_df) where val_df is 2018 data
+            # Test fold is at index 3: self.folds[3] = (train_all_previous, test_2019)
+            _, fold_3_val_df = self.folds[-2]  # Use fold 3's validation data (2018) for training
+            _, test_df = self.folds[-1]  # Use test fold's test data (2019)
+            train_df = fold_3_val_df
+            fold_index = 2  # Use fold 3's index for metadata
+            print("=" * 80)
+            print("EVALUATION MODE: Training on Fold 3 Validation Data (2018), Testing on Test Set (2019)")
+            print("=" * 80)
+            print("This helps avoid temporal drift from training on older data (2015-2017)")
+            print("when predicting 2019 test set.")
+        else:
+            # Default behavior: use all previous data for training (backwards compatible)
+            train_df, test_df = self.folds[-1]
+            fold_index = 3  # Test fold is always at index 3 (0-based: folds are 0, 1, 2, 3)
         
         # Set version and fold_index on estimator if it supports it
         if hasattr(self.estimator, 'setVersion'):
@@ -383,14 +473,154 @@ class FlightDelayCV:
                 'Split': 'Train',
                 'rmse': train_metric['rmse'],
                 'otpa': train_metric['otpa'],
-                'sddr': train_metric['sddr']
+                'otpa_precision': train_metric.get('otpa_precision', None),
+                'otpa_recall': train_metric.get('otpa_recall', None),
+                'otpa_f1': train_metric.get('otpa_f1', None),
+                'sddr': train_metric['sddr'],
+                'sddr_precision': train_metric.get('sddr_precision', None),
+                'sddr_recall': train_metric.get('sddr_recall', None),
+                'sddr_f1': train_metric.get('sddr_f1', None)
             },
             {
                 'Split': 'Test',
                 'rmse': test_metric['rmse'],
                 'otpa': test_metric['otpa'],
-                'sddr': test_metric['sddr']
+                'otpa_precision': test_metric.get('otpa_precision', None),
+                'otpa_recall': test_metric.get('otpa_recall', None),
+                'otpa_f1': test_metric.get('otpa_f1', None),
+                'sddr': test_metric['sddr'],
+                'sddr_precision': test_metric.get('sddr_precision', None),
+                'sddr_recall': test_metric.get('sddr_recall', None),
+                'sddr_f1': test_metric.get('sddr_f1', None)
             }
         ])
         
         return results
+    
+    def benchmark_inference(self, dataset="cv_folds", model=None, return_predictions=False):
+        """
+        Benchmark inference time on different datasets without re-training.
+        Useful for measuring model runtime on various dataset sizes.
+        
+        Args:
+            dataset (str): Which dataset to inference on. Options:
+                - "cv_folds": Inference on all 3 CV validation sets (one per fold)
+                - "test_train": Inference on test fold's training data (fold 4, all previous data)
+                - "fold_3_val": Inference on fold 3's validation data (2018 data, same as use_fold_3_val_train)
+            model: Optional model to use. If None, uses stored models from fit().
+                   For "cv_folds", should be a list of 3 models (one per fold) or None to use self.models.
+                   For other datasets, should be a single model or None to use self.test_model.
+            return_predictions (bool): If True, returns predictions DataFrame(s) in addition to timing.
+                                      If False, only returns timing information.
+        
+        Returns:
+            dict: Contains timing information and optionally predictions:
+                - "dataset": The dataset used
+                - "num_rows": Number of rows inferred on
+                - "total_time_seconds": Total inference time
+                - "time_per_row_seconds": Average time per row
+                - "predictions": (optional) Predictions DataFrame(s) if return_predictions=True
+        """
+        if dataset == "cv_folds":
+            if model is None:
+                if len(self.models) == 0:
+                    raise ValueError("No models found. Run fit() first or provide models.")
+                models = self.models
+            else:
+                if not isinstance(model, list) or len(model) != 3:
+                    raise ValueError("For 'cv_folds', model must be a list of 3 models or None to use stored models.")
+                models = model
+            
+            total_rows = 0
+            total_time = 0
+            predictions_list = []
+            
+            print("Benchmarking inference on CV validation sets...")
+            for i, (train_df, val_df) in enumerate(self.folds[:-1]):
+                if i >= len(models):
+                    break
+                
+                model = models[i]
+                num_rows = val_df.count()
+                total_rows += num_rows
+                
+                print(f"  Fold {i+1} validation set: {num_rows:,} rows...", end=" ")
+                start_time = time.time()
+                preds = model.transform(val_df)
+                # Force evaluation by counting (or materializing predictions)
+                _ = preds.count()  # Materialize the DataFrame
+                elapsed = time.time() - start_time
+                total_time += elapsed
+                print(f"{elapsed:.2f}s ({elapsed/num_rows*1000:.4f}ms per row)")
+                
+                if return_predictions:
+                    predictions_list.append(preds)
+            
+            result = {
+                "dataset": "cv_folds",
+                "num_rows": total_rows,
+                "total_time_seconds": total_time,
+                "time_per_row_seconds": total_time / total_rows if total_rows > 0 else 0,
+                "num_folds": len(models)
+            }
+            if return_predictions:
+                result["predictions"] = predictions_list
+            
+        elif dataset == "test_train":
+            if model is None:
+                if self.test_model is None:
+                    raise ValueError("No test model found. Run evaluate() first or provide a model.")
+                model = self.test_model
+            else:
+                model = model
+            
+            train_df, _ = self.folds[-1]
+            num_rows = train_df.count()
+            
+            print(f"Benchmarking inference on test fold's training data: {num_rows:,} rows...", end=" ")
+            start_time = time.time()
+            preds = model.transform(train_df)
+            _ = preds.count()  # Materialize
+            elapsed = time.time() - start_time
+            print(f"{elapsed:.2f}s ({elapsed/num_rows*1000:.4f}ms per row)")
+            
+            result = {
+                "dataset": "test_train",
+                "num_rows": num_rows,
+                "total_time_seconds": elapsed,
+                "time_per_row_seconds": elapsed / num_rows if num_rows > 0 else 0
+            }
+            if return_predictions:
+                result["predictions"] = preds
+        
+        elif dataset == "fold_3_val":
+            if model is None:
+                if self.test_model is None:
+                    raise ValueError("No test model found. Run evaluate() first or provide a model.")
+                model = self.test_model
+            else:
+                model = model
+            
+            _, fold_3_val_df = self.folds[-2]  # Fold 3's validation data (2018)
+            num_rows = fold_3_val_df.count()
+            
+            print(f"Benchmarking inference on fold 3 validation data (2018): {num_rows:,} rows...", end=" ")
+            start_time = time.time()
+            preds = model.transform(fold_3_val_df)
+            _ = preds.count()  # Materialize
+            elapsed = time.time() - start_time
+            print(f"{elapsed:.2f}s ({elapsed/num_rows*1000:.4f}ms per row)")
+            
+            result = {
+                "dataset": "fold_3_val",
+                "num_rows": num_rows,
+                "total_time_seconds": elapsed,
+                "time_per_row_seconds": elapsed / num_rows if num_rows > 0 else 0
+            }
+            if return_predictions:
+                result["predictions"] = preds
+        
+        else:
+            raise ValueError(f"Unknown dataset: {dataset}. Must be one of: 'cv_folds', 'test_train', 'fold_3_val'")
+        
+        return result
