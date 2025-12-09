@@ -17,13 +17,17 @@ from graphframes import GraphFrame
 # -------------------------
 # RDD-BASED PAGERANK IMPLEMENTATION (FAST)
 # -------------------------
-def _init_graph_rdd(edges_df, sc):
+def _init_graph_rdd(edges_df):
     """
     Initialize graph RDD from edges DataFrame.
     Returns: RDD of (node_id, (score, edges_dict)) where edges_dict maps neighbor -> weight
     
     Follows the homework 5 pattern but adapted for DataFrame input.
     """
+    # Get SparkContext from SparkSession (don't pass as parameter to avoid serialization issues)
+    spark = SparkSession.builder.getOrCreate()
+    sc = spark.sparkContext
+    
     # Convert edges to RDD: (src, dst, weight)
     # Handle both cases: weight column exists or defaults to 1
     if 'weight' in edges_df.columns:
@@ -60,7 +64,7 @@ def _init_graph_rdd(edges_df, sc):
     return graph_rdd, N
 
 
-def _run_pagerank_rdd(graph_rdd, N, alpha=0.15, max_iter=10, verbose=True, sc=None, initial_scores=None, tol=1e-4):
+def _run_pagerank_rdd(graph_rdd, N, alpha=0.15, max_iter=10, verbose=True, initial_scores=None, tol=1e-4):
     """
     Run PageRank using RDD implementation (much faster than GraphFrames).
     
@@ -73,7 +77,6 @@ def _run_pagerank_rdd(graph_rdd, N, alpha=0.15, max_iter=10, verbose=True, sc=No
         alpha: Reset probability (default 0.15)
         max_iter: Maximum iterations (default 25, reasonable balance between accuracy and speed)
         verbose: Print progress
-        sc: SparkContext
         initial_scores: Optional dict of {node_id: initial_score} for warm start (faster convergence)
         tol: Convergence tolerance - stop if max change in scores < tol (default 1e-4)
                Convergence is checked every 5 iterations (after iteration 5) to avoid expensive joins
@@ -81,9 +84,9 @@ def _run_pagerank_rdd(graph_rdd, N, alpha=0.15, max_iter=10, verbose=True, sc=No
     Returns:
         RDD of (node_id, pagerank_score)
     """
-    if sc is None:
-        spark = SparkSession.builder.getOrCreate()
-        sc = spark.sparkContext
+    # Get SparkContext from SparkSession (don't pass as parameter to avoid serialization issues)
+    spark = SparkSession.builder.getOrCreate()
+    sc = spark.sparkContext
     
     # Set checkpoint directory for lineage breaking (required for checkpoint())
     # Use a temporary directory if not already set
@@ -259,7 +262,6 @@ def compute_pagerank_features(train_df, val_df,
     # Build graph from training data only (CV-safe)
     # OPTIMIZATION: Use RDD reduceByKey instead of DataFrame groupBy for better performance
     # DataFrame groupBy is slower than RDD reduceByKey for this aggregation
-    sc = spark.sparkContext
     edges_rdd = (
         train_df
         .select(origin_col, dest_col)
@@ -315,10 +317,10 @@ def compute_pagerank_features(train_df, val_df,
     # Compute weighted PageRank using RDD implementation (supports native weights, no duplication needed)
     if verbose:
         print("  Computing weighted PageRank (RDD)...")
-    graph_weighted, N_w = _init_graph_rdd(edges, sc)
+    graph_weighted, N_w = _init_graph_rdd(edges)
     pagerank_weighted_rdd = _run_pagerank_rdd(
         graph_weighted, N_w, alpha=reset_probability, max_iter=max_iter, 
-        verbose=verbose, sc=sc, initial_scores=initial_weighted
+        verbose=verbose, initial_scores=initial_weighted
     )
     
     # Convert weighted RDD to DataFrame
@@ -705,10 +707,10 @@ class GraphFeaturesEstimator(Estimator):
         )
         
         # Compute weighted PageRank using RDD implementation (supports native weights)
-        graph_weighted, N_w = _init_graph_rdd(edges, sc)
+        graph_weighted, N_w = _init_graph_rdd(edges)
         pagerank_weighted_rdd = _run_pagerank_rdd(
             graph_weighted, N_w, alpha=self.reset_probability,
-            max_iter=self.max_iter, verbose=False, sc=sc
+            max_iter=self.max_iter, verbose=False
         )
         pagerank_weighted_df = self._spark.createDataFrame(
             pagerank_weighted_rdd.map(lambda x: (x[0], float(x[1]))),
@@ -732,4 +734,3 @@ class GraphFeaturesEstimator(Estimator):
             origin_col=self.origin_col,
             dest_col=self.dest_col
         )
-
