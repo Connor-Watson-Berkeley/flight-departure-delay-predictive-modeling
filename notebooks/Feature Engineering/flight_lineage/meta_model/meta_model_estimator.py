@@ -293,6 +293,13 @@ class MetaModelEstimator(Estimator):
                 # Temporal features (numerical)
                 'prev_flight_day_of_month',  # Minor effect
                 'prev_flight_crs_dep_time',  # Time of day (affects traffic/altitude)
+                
+                # Graph features (if available) - PageRank captures airport importance/connectivity
+                # These may be predictive if current flight's graph features correlate with prev_flight patterns
+                'origin_pagerank_weighted',
+                'origin_pagerank_unweighted',
+                'dest_pagerank_weighted',
+                'dest_pagerank_unweighted',
             ]
             
         elif target_name == "taxi_time":
@@ -338,6 +345,13 @@ class MetaModelEstimator(Estimator):
                 'prev_flight_day_of_month',
                 'prev_flight_crs_dep_time',
                 'prev_flight_crs_arr_time',
+                
+                # Graph features (if available) - PageRank captures airport importance/connectivity
+                # May correlate with taxi times at busy hubs vs smaller airports
+                'origin_pagerank_weighted',
+                'origin_pagerank_unweighted',
+                'dest_pagerank_weighted',
+                'dest_pagerank_unweighted',
             ]
             
         elif target_name == "total_duration":
@@ -384,6 +398,13 @@ class MetaModelEstimator(Estimator):
                 'prev_flight_day_of_month',
                 'prev_flight_crs_dep_time',
                 'prev_flight_crs_arr_time',
+                
+                # Graph features (if available) - PageRank captures airport importance/connectivity
+                # May correlate with both air time (route patterns) and taxi time (airport size)
+                'origin_pagerank_weighted',
+                'origin_pagerank_unweighted',
+                'dest_pagerank_weighted',
+                'dest_pagerank_unweighted',
             ]
         
         # Filter to only include features that exist in DataFrame
