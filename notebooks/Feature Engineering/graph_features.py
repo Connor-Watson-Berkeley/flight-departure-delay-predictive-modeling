@@ -47,10 +47,12 @@ class GraphFeaturesModel(Model):
             .drop("airport")
         )
         
-        # Add prev_flight_origin graph features (if prev_flight_origin column exists)
-        # Note: prev_flight_dest = origin (current flight's origin) in a rotation,
-        # so prev_flight_dest_pagerank_* = origin_pagerank_* (already exists above, no need to duplicate)
+        # Add prev_flight graph features (if prev_flight columns exist)
+        # Note: For rotations, prev_flight_dest = origin, but for jumps they differ
+        # We add both prev_flight_origin and prev_flight_dest PageRank features for meta models
+        # (main model only uses origin/dest, not prev_flight features)
         if "prev_flight_origin" in df_with_features.columns:
+            # Add prev_flight_origin PageRank
             df_with_features = (
                 df_with_features
                 .join(
@@ -60,6 +62,21 @@ class GraphFeaturesModel(Model):
                 )
                 .withColumnRenamed("pagerank_weighted", "prev_flight_origin_pagerank_weighted")
                 .withColumnRenamed("pagerank_unweighted", "prev_flight_origin_pagerank_unweighted")
+                .drop("airport")
+            )
+        
+        if "prev_flight_dest" in df_with_features.columns:
+            # Add prev_flight_dest PageRank (needed for jumps where prev_flight_dest != origin)
+            # For rotations, this will equal origin_pagerank_*, but for jumps it's different
+            df_with_features = (
+                df_with_features
+                .join(
+                    self.pagerank_scores,
+                    col("prev_flight_dest") == col("airport"),
+                    "left"
+                )
+                .withColumnRenamed("pagerank_weighted", "prev_flight_dest_pagerank_weighted")
+                .withColumnRenamed("pagerank_unweighted", "prev_flight_dest_pagerank_unweighted")
                 .drop("airport")
             )
         
@@ -76,11 +93,16 @@ class GraphFeaturesModel(Model):
             "dest_pagerank_weighted",
             "dest_pagerank_unweighted"
         ]
-        # Add prev_flight_origin graph feature columns if they exist
+        # Add prev_flight graph feature columns if they exist (for meta models)
         if "prev_flight_origin_pagerank_weighted" in df_with_features.columns:
             pagerank_cols.extend([
                 "prev_flight_origin_pagerank_weighted",
                 "prev_flight_origin_pagerank_unweighted"
+            ])
+        if "prev_flight_dest_pagerank_weighted" in df_with_features.columns:
+            pagerank_cols.extend([
+                "prev_flight_dest_pagerank_weighted",
+                "prev_flight_dest_pagerank_unweighted"
             ])
         
         for col_name in pagerank_cols:
@@ -101,11 +123,14 @@ class GraphFeaturesEstimator(Estimator):
     - origin_pagerank_unweighted: Unweighted PageRank of origin airport
     - dest_pagerank_weighted: Weighted PageRank of destination airport
     - dest_pagerank_unweighted: Unweighted PageRank of destination airport
-    - prev_flight_origin_pagerank_weighted: Weighted PageRank of previous flight's origin (if prev_flight_origin exists)
-    - prev_flight_origin_pagerank_unweighted: Unweighted PageRank of previous flight's origin (if prev_flight_origin exists)
+    - prev_flight_origin_pagerank_weighted: Weighted PageRank of previous flight's origin (if prev_flight_origin exists, for meta models)
+    - prev_flight_origin_pagerank_unweighted: Unweighted PageRank of previous flight's origin (if prev_flight_origin exists, for meta models)
+    - prev_flight_dest_pagerank_weighted: Weighted PageRank of previous flight's destination (if prev_flight_dest exists, for meta models)
+    - prev_flight_dest_pagerank_unweighted: Unweighted PageRank of previous flight's destination (if prev_flight_dest exists, for meta models)
     
-    Note: prev_flight_dest = origin (current flight's origin) in a rotation, so prev_flight_dest_pagerank_* 
-    is redundant with origin_pagerank_* and is not added as a separate feature.
+    Note: For rotations, prev_flight_dest = origin, so prev_flight_dest_pagerank_* = origin_pagerank_*.
+    However, for jumps (aircraft repositioning), prev_flight_dest != origin, so we need separate features.
+    These prev_flight features are used by meta models but not by the main model.
     """
     
     def __init__(self, 

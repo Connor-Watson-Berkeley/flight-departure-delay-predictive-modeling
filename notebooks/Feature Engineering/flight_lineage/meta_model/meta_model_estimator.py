@@ -36,6 +36,20 @@ class MetaModelModel(Model):
     
     def _transform(self, df):
         """Apply meta-models to predict previous flight components."""
+        # Create special case flags if they don't exist (for prediction on new data)
+        if "is_first_flight" not in df.columns:
+            df = df.withColumn(
+                "is_first_flight",
+                (col("lineage_rank") == 1).cast("int")  # Convert boolean to int for StringIndexer
+            )
+        if "is_jump" not in df.columns:
+            df = df.withColumn(
+                "is_jump",
+                col("lineage_is_jump").cast("int")  # Convert boolean to int for StringIndexer
+            )
+        
+        # Note: prev_flight graph features are now added by GraphFeaturesEstimator
+        # No need to add them here - they should already be in the DataFrame
         df_with_predictions = df
         
         # Predict air time
@@ -91,7 +105,8 @@ class MetaModelModel(Model):
             if "features" in df_with_predictions.columns:
                 df_with_predictions = df_with_predictions.drop("features")
         
-        # Impute NULL predictions (for first flights or jumps)
+        # Impute NULL predictions (safety net for edge cases - should be rare now that we train on all flights)
+        # Trees can handle NULL/missing values, but this provides a fallback for any edge cases
         df_with_predictions = df_with_predictions.withColumn(
             "predicted_prev_flight_air_time",
             coalesce(
@@ -157,14 +172,42 @@ class MetaModelEstimator(Estimator):
         if self.use_preprocessed_features:
             print(f"  Using preprocessed features (features should already be imputed, indexed, and encoded)")
         
-        # Prepare training data: only rows with previous flight information
-        # (exclude first flights and jumps)
-        train_with_prev = train_df.filter(
-            (col("lineage_rank") > 1) & 
-            (~col("lineage_is_jump").cast("boolean"))
+        # Create flags for special cases: first flights and jumps
+        # These allow the model to learn special handling for these cases
+        # When is_first_flight=True, model learns to predict imputed values (scheduled times)
+        # When is_jump=True, model learns to handle aircraft repositioning events
+        # This prevents these cases from contaminating predictions for normal flights
+        train_df = train_df.withColumn(
+            "is_first_flight",
+            (col("lineage_rank") == 1).cast("int")  # Convert boolean to int for StringIndexer
+        )
+        train_df = train_df.withColumn(
+            "is_jump",
+            col("lineage_is_jump").cast("int")  # Convert boolean to int for StringIndexer
         )
         
-        print(f"  Training on {train_with_prev.count()} rows with previous flight data")
+        # Prepare training data: include ALL flights (first flights, jumps, and normal rotations)
+        # We now include jumps because:
+        # 1. We need to inference on jumps anyway (they occur in production)
+        # 2. Trees can handle NULL/missing values in predictions
+        # 3. There are "known jumps" when we have data gaps due to weather station data bugs
+        # 4. The is_jump flag allows the model to learn special handling for jumps
+        # First flights and jumps will have imputed prev_flight_* features from flight_lineage_features.py
+        # The model will learn to handle these cases via the is_first_flight and is_jump flags
+        train_with_prev = train_df  # No filtering - include all flights
+        
+        # Note: prev_flight graph features are now added by GraphFeaturesEstimator
+        # No need to add them here - they should already be in the DataFrame
+        
+        # Count breakdown for logging
+        total_count = train_with_prev.count()
+        first_flight_count = train_with_prev.filter(col("is_first_flight") == 1).count()
+        jump_count = train_with_prev.filter(col("is_jump") == 1).count()
+        normal_count = total_count - first_flight_count - jump_count
+        print(f"  Training on {total_count} rows total:")
+        print(f"    - Normal rotations: {normal_count}")
+        print(f"    - First flights: {first_flight_count} (with is_first_flight flag)")
+        print(f"    - Jumps: {jump_count} (with is_jump flag)")
         
         # Debug: Check what columns are available
         available_cols = set(train_with_prev.columns)
@@ -194,7 +237,12 @@ class MetaModelEstimator(Estimator):
             1 if taxi_time_pipeline is not None else 0,
             1 if total_duration_pipeline is not None else 0
         ])
-        print(f"✓ Meta-model training complete! ({trained_count}/3 models trained)")
+        
+        end_time = datetime.now()
+        duration = end_time - start_time
+        timestamp = end_time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] ✓ Meta-model training complete! ({trained_count}/3 models trained, took {duration})")
+        
         if trained_count < 3:
             print(f"  ⚠ Warning: Only {trained_count} out of 3 meta-models trained successfully.")
             if air_time_pipeline is None:
@@ -241,13 +289,25 @@ class MetaModelEstimator(Estimator):
         
         # Target-specific feature selection
         if target_name == "air_time":
-            # AIR TIME: Highly dependent on distance, origin/dest, and seasonal patterns (jet streams)
+            # AIR TIME: Time from prev_flight_origin (departure) → prev_flight_dest (arrival)
+            # Highly dependent on distance, origin/dest, and seasonal patterns (jet streams)
             # Key insight: Distance + origin + dest can approximate route-specific patterns
             # without the 3000+ cardinality of explicit route combinations
             categorical_features = [
-                # Airport features - capture route-specific patterns without high cardinality
-                'prev_flight_origin',        # Origin airport (~200 categories) - affects departure routing
-                'prev_flight_dest',          # Destination airport (~200 categories) - affects arrival routing
+                # Special case flags - allow model to learn special handling
+                # When is_first_flight=True, model learns to predict imputed values (scheduled times)
+                # When is_jump=True, model learns to handle aircraft repositioning events
+                # This prevents these cases from contaminating predictions for normal flights
+                'is_first_flight',  # Boolean flag: lineage_rank == 1
+                'is_jump',          # Boolean flag: lineage_is_jump (aircraft repositioning or data gaps)
+                
+                # Airport features - capture route-specific patterns
+                # Air time is from prev_flight_origin → prev_flight_dest (not origin!)
+                'prev_flight_origin',        # Previous flight's origin airport (~200 categories) - where it departed
+                'prev_flight_dest',          # Previous flight's destination airport (~200 categories) - where it arrived
+                # Note: For jumps, prev_flight_dest != origin, so we need prev_flight_dest explicitly
+                # Note: For first flights, these are imputed to origin (from flight_lineage_features.py)
+                # Note: For jumps, these represent the actual previous flight route (repositioning)
                 # Random Forest will learn origin×dest interactions implicitly through tree splits
                 
                 # Month - CRITICAL for jet streams and seasonal wind patterns
@@ -294,20 +354,28 @@ class MetaModelEstimator(Estimator):
                 'prev_flight_day_of_month',  # Minor effect
                 'prev_flight_crs_dep_time',  # Time of day (affects traffic/altitude)
                 
-                # Graph features (if available) - PageRank captures airport importance/connectivity
-                # These may be predictive if current flight's graph features correlate with prev_flight patterns
-                'origin_pagerank_weighted',
-                'origin_pagerank_unweighted',
-                'dest_pagerank_weighted',
-                'dest_pagerank_unweighted',
+                # Graph features for previous flight's route (prev_flight_origin → prev_flight_dest)
+                # PageRank captures airport importance/connectivity
+                # Note: For jumps, prev_flight_dest != origin, so we need prev_flight_dest_pagerank_* explicitly
+                'prev_flight_origin_pagerank_weighted',
+                'prev_flight_origin_pagerank_unweighted',
+                'prev_flight_dest_pagerank_weighted',  # Needed for jumps (prev_flight_dest != origin)
+                'prev_flight_dest_pagerank_unweighted',
             ]
             
         elif target_name == "taxi_time":
             # TAXI TIME: Dependent on airport congestion, time of day, weather
+            # Taxi time is airport-specific (not route-specific), so we only need current flight's origin
+            # (which is where the previous flight landed and where taxi-out happens)
             categorical_features = [
+                # Special case flags - allow model to learn special handling
+                'is_first_flight',  # Boolean flag: lineage_rank == 1
+                'is_jump',          # Boolean flag: lineage_is_jump (aircraft repositioning or data gaps)
+                
                 # Airport-level (taxi time is airport-specific, not route-specific)
-                'prev_flight_origin',        # Origin airport (taxi-out)
-                'prev_flight_dest',          # Destination airport (taxi-in)
+                'origin',                    # Current flight's origin (where taxi-out happens, = prev_flight_dest)
+                # Note: For first flights, prev_flight_dest is imputed to origin
+                # Note: For jumps, prev_flight_dest != origin (repositioning)
                 
                 # Time blocks - CRITICAL for congestion patterns
                 'prev_flight_dep_time_blk',  # Departure time block (affects taxi-out)
@@ -323,8 +391,7 @@ class MetaModelEstimator(Estimator):
                 'prev_flight_op_carrier',
                 
                 # State-level (lower cardinality)
-                'prev_flight_origin_state_abr',
-                'prev_flight_dest_state_abr',
+                'origin_state_abr',          # Current flight's origin state (= prev_flight_dest_state)
             ]
             
             numerical_features = [
@@ -346,21 +413,37 @@ class MetaModelEstimator(Estimator):
                 'prev_flight_crs_dep_time',
                 'prev_flight_crs_arr_time',
                 
-                # Graph features (if available) - PageRank captures airport importance/connectivity
-                # May correlate with taxi times at busy hubs vs smaller airports
-                'origin_pagerank_weighted',
+                # Graph features for airport where plane is currently (current origin)
+                # Taxi time is predicted for the plane's current location (current flight's origin)
+                # The plane is taxiing at the current origin airport when we make the prediction
+                # PageRank captures airport importance/connectivity, which affects taxi times
+                # (busy hubs have longer taxi times than smaller airports)
+                # Note: For normal rotations, prev_flight_dest = origin, so origin_pagerank_* is correct
+                # Note: For jumps, prev_flight_dest != origin, but we still use origin_pagerank_* because
+                #       the plane is at the current origin when we're predicting (current departure time is a feature)
+                'origin_pagerank_weighted',  # Current flight's origin (where plane is now, where taxi happens)
                 'origin_pagerank_unweighted',
-                'dest_pagerank_weighted',
-                'dest_pagerank_unweighted',
+                # Also include prev_flight_origin for context (where previous flight departed from)
+                'prev_flight_origin_pagerank_weighted',  # Previous flight's origin (context)
+                'prev_flight_origin_pagerank_unweighted',
             ]
             
         elif target_name == "total_duration":
             # TOTAL DURATION: Combination of air time + taxi time
+            # Air time is from prev_flight_origin → prev_flight_dest
             # Use features from both, but focus on strongest predictors
             categorical_features = [
+                # Special case flags - allow model to learn special handling
+                'is_first_flight',  # Boolean flag: lineage_rank == 1
+                'is_jump',          # Boolean flag: lineage_is_jump (aircraft repositioning or data gaps)
+                
                 # Airport features (air time component) - origin + dest + distance capture route patterns
-                'prev_flight_origin',        # Origin airport (~200 categories)
-                'prev_flight_dest',          # Destination airport (~200 categories)
+                # Total duration includes air time (prev_flight_origin → prev_flight_dest)
+                'prev_flight_origin',        # Previous flight's origin airport (~200 categories) - where it departed
+                'prev_flight_dest',          # Previous flight's destination airport (~200 categories) - where it arrived
+                # Note: For jumps, prev_flight_dest != origin, so we need prev_flight_dest explicitly
+                # Note: For first flights, these are imputed to origin (from flight_lineage_features.py)
+                # Note: For jumps, these represent the actual previous flight route (repositioning)
                 
                 # Temporal (affects both air and taxi)
                 'prev_flight_month',           # Jet streams (air) + seasonal patterns (taxi)
@@ -399,17 +482,52 @@ class MetaModelEstimator(Estimator):
                 'prev_flight_crs_dep_time',
                 'prev_flight_crs_arr_time',
                 
-                # Graph features (if available) - PageRank captures airport importance/connectivity
+                # Graph features for previous flight's route (prev_flight_origin → prev_flight_dest)
+                # PageRank captures airport importance/connectivity
                 # May correlate with both air time (route patterns) and taxi time (airport size)
-                'origin_pagerank_weighted',
-                'origin_pagerank_unweighted',
-                'dest_pagerank_weighted',
-                'dest_pagerank_unweighted',
+                # Note: For jumps, prev_flight_dest != origin, so we need prev_flight_dest_pagerank_* explicitly
+                'prev_flight_origin_pagerank_weighted',
+                'prev_flight_origin_pagerank_unweighted',
+                'prev_flight_dest_pagerank_weighted',  # Needed for jumps (prev_flight_dest != origin)
+                'prev_flight_dest_pagerank_unweighted',
             ]
         
         # Filter to only include features that exist in DataFrame
         available_categorical = [f for f in categorical_features if f in df.columns]
         available_numerical = [f for f in numerical_features if f in df.columns]
+        
+        # Validate graph features are available (target-specific)
+        if target_name == "air_time":
+            graph_feature_names = [
+                'prev_flight_origin_pagerank_weighted',
+                'prev_flight_origin_pagerank_unweighted',
+                'prev_flight_dest_pagerank_weighted',  # Needed for jumps (prev_flight_dest != origin)
+                'prev_flight_dest_pagerank_unweighted'
+            ]
+        elif target_name == "taxi_time":
+            graph_feature_names = [
+                'origin_pagerank_weighted',  # Current origin (where plane is now, where taxi happens)
+                'origin_pagerank_unweighted',
+                'prev_flight_origin_pagerank_weighted',  # Context (where previous flight departed)
+                'prev_flight_origin_pagerank_unweighted'
+            ]
+        elif target_name == "total_duration":
+            graph_feature_names = [
+                'prev_flight_origin_pagerank_weighted',
+                'prev_flight_origin_pagerank_unweighted',
+                'prev_flight_dest_pagerank_weighted',  # Needed for jumps (prev_flight_dest != origin)
+                'prev_flight_dest_pagerank_unweighted'
+            ]
+        else:
+            graph_feature_names = []
+        
+        available_graph_features = [f for f in graph_feature_names if f in available_numerical]
+        if available_graph_features:
+            print(f"    ✓ Graph features found: {available_graph_features}")
+        else:
+            print(f"    ⚠ Warning: No graph features found in DataFrame for {target_name} meta-model")
+            print(f"      Expected: {graph_feature_names}")
+            print(f"      Available numerical features: {[f for f in available_numerical if 'pagerank' in f.lower()]}")
         
         return available_categorical, available_numerical
     
@@ -429,6 +547,26 @@ class MetaModelEstimator(Estimator):
             available_cols = set(processed_df.columns)
             processed_numerical = [f"{col}_IMPUTED" for col in numerical_features if f"{col}_IMPUTED" in available_cols]
             processed_categorical = [f"{col}_VEC" for col in categorical_features if f"{col}_VEC" in available_cols]
+            
+            # Validate graph features in processed features
+            # Note: For rotations, prev_flight_dest = origin, but for jumps they differ
+            # We use prev_flight_dest_pagerank_* explicitly to handle jumps correctly
+            graph_feature_names = [
+                'prev_flight_origin_pagerank_weighted',
+                'prev_flight_origin_pagerank_unweighted',
+                'prev_flight_dest_pagerank_weighted',  # Needed for jumps (prev_flight_dest != origin)
+                'prev_flight_dest_pagerank_unweighted',
+                'origin_pagerank_weighted',
+                'origin_pagerank_unweighted',
+                'dest_pagerank_weighted',
+                'dest_pagerank_unweighted'
+            ]
+            processed_graph_features = [f"{col}_IMPUTED" for col in graph_feature_names if f"{col}_IMPUTED" in processed_numerical]
+            if processed_graph_features:
+                print(f"    ✓ Graph features found in processed features: {processed_graph_features}")
+            else:
+                print(f"    ⚠ Warning: No processed graph features found")
+                print(f"      Expected: {[f'{col}_IMPUTED' for col in graph_feature_names]}")
             
             # Assemble processed features
             assembler = VectorAssembler(
