@@ -47,6 +47,22 @@ class GraphFeaturesModel(Model):
             .drop("airport")
         )
         
+        # Add prev_flight_origin graph features (if prev_flight_origin column exists)
+        # Note: prev_flight_dest = origin (current flight's origin) in a rotation,
+        # so prev_flight_dest_pagerank_* = origin_pagerank_* (already exists above, no need to duplicate)
+        if "prev_flight_origin" in df_with_features.columns:
+            df_with_features = (
+                df_with_features
+                .join(
+                    self.pagerank_scores,
+                    col("prev_flight_origin") == col("airport"),
+                    "left"
+                )
+                .withColumnRenamed("pagerank_weighted", "prev_flight_origin_pagerank_weighted")
+                .withColumnRenamed("pagerank_unweighted", "prev_flight_origin_pagerank_unweighted")
+                .drop("airport")
+            )
+        
         # Fill NULL PageRank values with 0 (for airports not in training graph)
         # TODO: Consider better imputation strategy. Isolated nodes in PageRank still receive
         #       PageRank from teleportation (reset probability). A new airport not in the training
@@ -60,6 +76,13 @@ class GraphFeaturesModel(Model):
             "dest_pagerank_weighted",
             "dest_pagerank_unweighted"
         ]
+        # Add prev_flight_origin graph feature columns if they exist
+        if "prev_flight_origin_pagerank_weighted" in df_with_features.columns:
+            pagerank_cols.extend([
+                "prev_flight_origin_pagerank_weighted",
+                "prev_flight_origin_pagerank_unweighted"
+            ])
+        
         for col_name in pagerank_cols:
             df_with_features = df_with_features.fillna({col_name: 0.0})
         
@@ -78,6 +101,11 @@ class GraphFeaturesEstimator(Estimator):
     - origin_pagerank_unweighted: Unweighted PageRank of origin airport
     - dest_pagerank_weighted: Weighted PageRank of destination airport
     - dest_pagerank_unweighted: Unweighted PageRank of destination airport
+    - prev_flight_origin_pagerank_weighted: Weighted PageRank of previous flight's origin (if prev_flight_origin exists)
+    - prev_flight_origin_pagerank_unweighted: Unweighted PageRank of previous flight's origin (if prev_flight_origin exists)
+    
+    Note: prev_flight_dest = origin (current flight's origin) in a rotation, so prev_flight_dest_pagerank_* 
+    is redundant with origin_pagerank_* and is not added as a separate feature.
     """
     
     def __init__(self, 
@@ -185,4 +213,3 @@ class GraphFeaturesEstimator(Estimator):
             origin_col=self.origin_col,
             dest_col=self.dest_col
         )
-
