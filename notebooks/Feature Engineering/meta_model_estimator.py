@@ -21,6 +21,23 @@ from pyspark.ml import Pipeline
 from datetime import datetime
 
 
+# -------------------------
+# META-MODEL IDENTIFIERS
+# -------------------------
+# Model IDs for precomputed meta-model predictions
+# Format: predicted_{target}_{MODEL_ID}
+# Allows multiple models to predict the same target (e.g., RF_1, RF_2, XGB_1)
+META_MODEL_IDS = {
+    "RF_1": {
+        "description": "Random Forest v1 (50 trees, max_depth=20, min_instances_per_node=20)",
+        "num_trees": 50,
+        "max_depth": 20,
+        "min_instances_per_node": 20,
+        "use_preprocessed_features": True
+    }
+}
+
+
 class MetaModelModel(Model):
     """Model returned by MetaModelEstimator after fitting"""
     
@@ -35,7 +52,37 @@ class MetaModelModel(Model):
         self._spark = SparkSession.builder.getOrCreate()
     
     def _transform(self, df):
-        """Apply meta-models to predict previous flight components."""
+        """
+        Apply meta-models to predict previous flight components.
+        
+        If pipelines are None (pass-through mode), uses existing precomputed predictions.
+        Otherwise, computes predictions using trained pipelines.
+        """
+        # Pass-through mode: predictions already exist (precomputed in split.py)
+        if (self._air_time_pipeline is None and 
+            self._taxi_time_pipeline is None and 
+            self._total_duration_pipeline is None):
+            # Check if predictions exist (look for any model_id pattern)
+            existing_pred_cols = [col for col in df.columns if col.startswith("predicted_prev_flight_air_time_")]
+            if existing_pred_cols:
+                # Extract model_id and rename to standard names for backwards compatibility
+                model_id = existing_pred_cols[0].replace("predicted_prev_flight_air_time_", "")
+                df = df.withColumnRenamed(
+                    f"predicted_prev_flight_air_time_{model_id}",
+                    "predicted_prev_flight_air_time"
+                ).withColumnRenamed(
+                    f"predicted_prev_flight_taxi_time_{model_id}",
+                    "predicted_prev_flight_taxi_time"
+                ).withColumnRenamed(
+                    f"predicted_prev_flight_total_duration_{model_id}",
+                    "predicted_prev_flight_total_duration"
+                )
+                return df
+            else:
+                raise ValueError("Meta-model predictions not found. "
+                               "Either precompute predictions or fit the model first.")
+        
+        # Normal mode: compute predictions using trained pipelines
         # Create special case flags if they don't exist (for prediction on new data)
         if "is_first_flight" not in df.columns:
             df = df.withColumn(
@@ -131,6 +178,40 @@ class MetaModelModel(Model):
             )
         )
         
+        # Safety check: Validate that predictions exist and are reasonable
+        # Check if predictions are all NULL (should not happen with coalesce, but verify)
+        total_rows = df_with_predictions.count()
+        if total_rows > 0:
+            air_time_null = df_with_predictions.filter(
+                col("predicted_prev_flight_air_time").isNull()
+            ).count()
+            taxi_time_null = df_with_predictions.filter(
+                col("predicted_prev_flight_taxi_time").isNull()
+            ).count()
+            total_duration_null = df_with_predictions.filter(
+                col("predicted_prev_flight_total_duration").isNull()
+            ).count()
+            
+            if air_time_null > 0 or taxi_time_null > 0 or total_duration_null > 0:
+                raise ValueError(
+                    f"Meta-model predictions contain NULL values after imputation! "
+                    f"air_time: {air_time_null}/{total_rows}, "
+                    f"taxi_time: {taxi_time_null}/{total_rows}, "
+                    f"total_duration: {total_duration_null}/{total_rows}. "
+                    f"This indicates a serious issue with meta-model inference."
+                )
+            
+            # Check if predictions are all zeros (indicates potential failure)
+            air_time_zero = df_with_predictions.filter(
+                col("predicted_prev_flight_air_time") == 0.0
+            ).count()
+            if air_time_zero == total_rows:
+                raise ValueError(
+                    f"All meta-model predictions for air_time are 0.0! "
+                    f"This indicates meta-model inference failed. "
+                    f"Check that meta-models were trained successfully."
+                )
+        
         return df_with_predictions
 
 
@@ -164,7 +245,23 @@ class MetaModelEstimator(Estimator):
         
         Note: CV-safe - only uses training data passed to `.fit()`.
         If use_preprocessed_features=True, assumes features are already processed.
+        
+        If predictions already exist (precomputed in split.py), skips training and returns pass-through model.
         """
+        # Check if predictions already exist (precomputed)
+        # Look for any model_id predictions
+        existing_pred_cols = [col for col in train_df.columns if col.startswith("predicted_prev_flight_air_time_")]
+        if existing_pred_cols:
+            # Extract model_id from first existing column
+            existing_model_id = existing_pred_cols[0].replace("predicted_prev_flight_air_time_", "")
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Meta-model predictions already present ({existing_model_id}), skipping training")
+            # Return pass-through model that uses existing predictions
+            return MetaModelModel(
+                air_time_pipeline=None,  # None indicates pass-through mode
+                taxi_time_pipeline=None,
+                total_duration_pipeline=None
+            )
+        
         start_time = datetime.now()
         timestamp = start_time.strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{timestamp}] Training meta-models for previous flight component prediction...")
@@ -204,27 +301,7 @@ class MetaModelEstimator(Estimator):
         first_flight_count = train_with_prev.filter(col("is_first_flight") == 1).count()
         jump_count = train_with_prev.filter(col("is_jump") == 1).count()
         normal_count = total_count - first_flight_count - jump_count
-        print(f"  Training on {total_count} rows total:")
-        print(f"    - Normal rotations: {normal_count}")
-        print(f"    - First flights: {first_flight_count} (with is_first_flight flag)")
-        print(f"    - Jumps: {jump_count} (with is_jump flag)")
-        
-        # Debug: Check what columns are available
-        available_cols = set(train_with_prev.columns)
-        prev_flight_cols = [col for col in available_cols if col.startswith('prev_flight_')]
-        print(f"  Debug: Found {len(prev_flight_cols)} prev_flight_* columns")
-        critical_cols = [
-            'prev_flight_air_time',
-            'prev_flight_taxi_in',
-            'prev_flight_taxi_out',
-            'prev_flight_actual_elapsed_time'
-        ]
-        for col_name in critical_cols:
-            if col_name in available_cols:
-                non_null_count = train_with_prev.filter(col(col_name).isNotNull()).count()
-                print(f"    ✓ {col_name}: exists ({non_null_count} non-null rows)")
-            else:
-                print(f"    ✗ {col_name}: MISSING")
+        print(f"  Training on {total_count:,} rows ({normal_count:,} rotations, {first_flight_count:,} first flights, {jump_count:,} jumps)")
         
         # Train meta-models
         air_time_pipeline = self._train_air_time_model(train_with_prev)
@@ -241,21 +318,19 @@ class MetaModelEstimator(Estimator):
         end_time = datetime.now()
         duration = end_time - start_time
         timestamp = end_time.strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{timestamp}] ✓ Meta-model training complete! ({trained_count}/3 models trained, took {duration})")
         
         if trained_count < 3:
-            print(f"  ⚠ Warning: Only {trained_count} out of 3 meta-models trained successfully.")
+            print(f"[{timestamp}] ⚠ Meta-model training complete ({trained_count}/3 models, took {duration})")
+            failed = []
             if air_time_pipeline is None:
-                print(f"    - Air time meta-model: FAILED")
+                failed.append("air_time")
             if taxi_time_pipeline is None:
-                print(f"    - Taxi time meta-model: FAILED")
+                failed.append("taxi_time")
             if total_duration_pipeline is None:
-                print(f"    - Total duration meta-model: FAILED")
+                failed.append("total_duration")
+            print(f"  ⚠ Failed: {', '.join(failed)}")
         else:
-            print(f"  ✓ All 3 meta-models trained successfully:")
-            print(f"    - Air time meta-model: ✓")
-            print(f"    - Taxi time meta-model: ✓")
-            print(f"    - Total duration meta-model: ✓")
+            print(f"[{timestamp}] ✓ Meta-model training complete! (3/3 models, took {duration})")
         
         return MetaModelModel(
             air_time_pipeline=air_time_pipeline,
@@ -531,12 +606,8 @@ class MetaModelEstimator(Estimator):
             graph_feature_names = []
         
         available_graph_features = [f for f in graph_feature_names if f in available_numerical]
-        if available_graph_features:
-            print(f"    ✓ Graph features found: {available_graph_features}")
-        else:
-            print(f"    ⚠ Warning: No graph features found in DataFrame for {target_name} meta-model")
-            print(f"      Expected: {graph_feature_names}")
-            print(f"      Available numerical features: {[f for f in available_numerical if 'pagerank' in f.lower()]}")
+        if not available_graph_features:
+            print(f"    ⚠ Warning: No graph features found for {target_name} meta-model")
         
         return available_categorical, available_numerical
     
@@ -571,11 +642,8 @@ class MetaModelEstimator(Estimator):
                 'dest_pagerank_unweighted'
             ]
             processed_graph_features = [f"{col}_IMPUTED" for col in graph_feature_names if f"{col}_IMPUTED" in processed_numerical]
-            if processed_graph_features:
-                print(f"    ✓ Graph features found in processed features: {processed_graph_features}")
-            else:
+            if not processed_graph_features:
                 print(f"    ⚠ Warning: No processed graph features found")
-                print(f"      Expected: {[f'{col}_IMPUTED' for col in graph_feature_names]}")
             
             # Assemble processed features
             assembler = VectorAssembler(
@@ -641,11 +709,11 @@ class MetaModelEstimator(Estimator):
     
     def _train_air_time_model(self, train_df):
         """Train meta-model to predict prev_flight_air_time."""
-        print("  Training meta-model: prev_flight_air_time")
+        print("  Training meta-model: prev_flight_air_time", end="")
         
         # Check if target exists
         if "prev_flight_air_time" not in train_df.columns:
-            print("    ⚠ Warning: prev_flight_air_time not found. Skipping air time meta-model.")
+            print(" - ⚠ SKIPPED (target not found)")
             return None
         
         # Filter to rows with valid target
@@ -653,17 +721,15 @@ class MetaModelEstimator(Estimator):
         count = train_air_time.count()
         
         if count < 100:
-            print(f"    ⚠ Warning: Only {count} rows with prev_flight_air_time. Skipping.")
+            print(f" - ⚠ SKIPPED (only {count} rows)")
             return None
-        
-        print(f"    Training on {count} rows")
         
         # Get features
         categorical_features, numerical_features = self._get_meta_model_features(
             train_air_time, "air_time"
         )
         
-        print(f"    Using {len(categorical_features)} categorical and {len(numerical_features)} numerical features")
+        print(f" ({count:,} rows, {len(categorical_features)} cat, {len(numerical_features)} num)", end="")
         
         # Build and fit pipeline
         pipeline = self._build_meta_model_pipeline(
@@ -674,13 +740,13 @@ class MetaModelEstimator(Estimator):
         )
         
         fitted_pipeline = pipeline.fit(train_air_time)
-        print(f"    ✓ Air time meta-model trained")
+        print(" ✓")
         
         return fitted_pipeline
     
     def _train_taxi_time_model(self, train_df):
         """Train meta-model to predict prev_flight_taxi_time (taxi_in + taxi_out)."""
-        print("  Training meta-model: prev_flight_taxi_time")
+        print("  Training meta-model: prev_flight_taxi_time", end="")
         
         # Compute taxi time if not already computed
         if "prev_flight_taxi_time" not in train_df.columns:
@@ -698,17 +764,15 @@ class MetaModelEstimator(Estimator):
         count = train_taxi_time.count()
         
         if count < 100:
-            print(f"    ⚠ Warning: Only {count} rows with prev_flight_taxi_time. Skipping.")
+            print(f" - ⚠ SKIPPED (only {count} rows)")
             return None
-        
-        print(f"    Training on {count} rows")
         
         # Get features
         categorical_features, numerical_features = self._get_meta_model_features(
             train_taxi_time, "taxi_time"
         )
         
-        print(f"    Using {len(categorical_features)} categorical and {len(numerical_features)} numerical features")
+        print(f" ({count:,} rows, {len(categorical_features)} cat, {len(numerical_features)} num)", end="")
         
         # Build and fit pipeline
         pipeline = self._build_meta_model_pipeline(
@@ -719,17 +783,17 @@ class MetaModelEstimator(Estimator):
         )
         
         fitted_pipeline = pipeline.fit(train_taxi_time)
-        print(f"    ✓ Taxi time meta-model trained")
+        print(" ✓")
         
         return fitted_pipeline
     
     def _train_total_duration_model(self, train_df):
         """Train meta-model to predict prev_flight_total_duration (actual_elapsed_time)."""
-        print("  Training meta-model: prev_flight_total_duration")
+        print("  Training meta-model: prev_flight_total_duration", end="")
         
         # Use actual_elapsed_time as target
         if "prev_flight_actual_elapsed_time" not in train_df.columns:
-            print("    ⚠ Warning: prev_flight_actual_elapsed_time not found. Skipping total duration meta-model.")
+            print(" - ⚠ SKIPPED (target not found)")
             return None
         
         # Filter to rows with valid target
@@ -737,10 +801,8 @@ class MetaModelEstimator(Estimator):
         count = train_total_duration.count()
         
         if count < 100:
-            print(f"    ⚠ Warning: Only {count} rows with prev_flight_actual_elapsed_time. Skipping.")
+            print(f" - ⚠ SKIPPED (only {count} rows)")
             return None
-        
-        print(f"    Training on {count} rows")
         
         # Temporarily rename for pipeline
         train_total_duration = train_total_duration.withColumn(
@@ -753,7 +815,7 @@ class MetaModelEstimator(Estimator):
             train_total_duration, "total_duration"
         )
         
-        print(f"    Using {len(categorical_features)} categorical and {len(numerical_features)} numerical features")
+        print(f" ({count:,} rows, {len(categorical_features)} cat, {len(numerical_features)} num)", end="")
         
         # Build and fit pipeline
         pipeline = self._build_meta_model_pipeline(
@@ -764,6 +826,107 @@ class MetaModelEstimator(Estimator):
         )
         
         fitted_pipeline = pipeline.fit(train_total_duration)
-        print(f"    ✓ Total duration meta-model trained")
+        print(" ✓")
         
         return fitted_pipeline
+
+
+# -------------------------
+# REUSABLE META-MODEL COMPUTATION FUNCTION
+# -------------------------
+def compute_meta_model_predictions(train_df, val_df, model_id="RF_1", verbose=True):
+    """
+    Train meta-models on training data and apply predictions to both train and val DataFrames.
+    
+    This function is designed for precomputing meta-model predictions during fold creation.
+    It trains on training data only (CV-safe) and applies to both train and val.
+    
+    Args:
+        train_df: Training DataFrame (used to train meta-models)
+        val_df: Validation/test DataFrame (gets predictions joined)
+        model_id: Model identifier (e.g., "RF_1") - must exist in META_MODEL_IDS
+        verbose: Whether to print progress messages
+    
+    Returns:
+        tuple: (train_df_with_predictions, val_df_with_predictions) both with predicted columns:
+            - predicted_prev_flight_air_time_{model_id}
+            - predicted_prev_flight_taxi_time_{model_id}
+            - predicted_prev_flight_total_duration_{model_id}
+    """
+    if model_id not in META_MODEL_IDS:
+        raise ValueError(f"Unknown model_id: {model_id}. Available: {list(META_MODEL_IDS.keys())}")
+    
+    model_config = META_MODEL_IDS[model_id]
+    
+    if verbose:
+        start_time = datetime.now()
+        timestamp = start_time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] Computing meta-model predictions ({model_id})...")
+        print(f"  Config: {model_config['description']}")
+    
+    # Create estimator with model config
+    estimator = MetaModelEstimator(
+        num_trees=model_config["num_trees"],
+        max_depth=model_config["max_depth"],
+        min_instances_per_node=model_config["min_instances_per_node"],
+        use_preprocessed_features=model_config["use_preprocessed_features"]
+    )
+    
+    # Train on training data
+    model = estimator.fit(train_df)
+    
+    # Apply to both train and val
+    try:
+        train_with_predictions = model.transform(train_df)
+        val_with_predictions = model.transform(val_df)
+    except Exception as e:
+        raise RuntimeError(
+            f"Meta-model inference failed! Error: {str(e)}\n"
+            f"This may indicate missing features or model training issues. "
+            f"Check that all required features are present in the DataFrames."
+        ) from e
+    
+    # Rename prediction columns to include model_id
+    prediction_cols = [
+        "predicted_prev_flight_air_time",
+        "predicted_prev_flight_taxi_time",
+        "predicted_prev_flight_total_duration"
+    ]
+    
+    for col_name in prediction_cols:
+        if col_name in train_with_predictions.columns:
+            new_name = f"{col_name}_{model_id}"
+            train_with_predictions = train_with_predictions.withColumnRenamed(col_name, new_name)
+            val_with_predictions = val_with_predictions.withColumnRenamed(col_name, new_name)
+        else:
+            if verbose:
+                print(f"  ⚠ Warning: Prediction column '{col_name}' not found in output. Meta-model may have failed.")
+    
+    # Safety check: Validate that predictions were created
+    missing_cols = [col for col in prediction_cols if f"{col}_{model_id}" not in val_with_predictions.columns]
+    if missing_cols:
+        raise ValueError(
+            f"Meta-model predictions missing for: {missing_cols}. "
+            f"Expected columns: {[f'{col}_{model_id}' for col in prediction_cols]}. "
+            f"Available columns: {sorted(val_with_predictions.columns)}. "
+            f"This indicates meta-model inference failed."
+        )
+    
+    if verbose:
+        # Validate predictions are reasonable (not all zeros)
+        val_total = val_with_predictions.count()
+        if val_total > 0:
+            air_time_col = f"predicted_prev_flight_air_time_{model_id}"
+            air_time_zero = val_with_predictions.filter(col(air_time_col) == 0.0).count()
+            if air_time_zero == val_total:
+                print(f"  ⚠ WARNING: All validation predictions for air_time are 0.0! This may indicate inference failure.")
+            elif air_time_zero > val_total * 0.5:
+                print(f"  ⚠ Warning: {air_time_zero:,}/{val_total:,} validation predictions for air_time are 0.0 (>{air_time_zero/val_total*100:.1f}%)")
+        
+        end_time = datetime.now()
+        duration = end_time - start_time
+        timestamp = end_time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] ✓ Meta-model predictions computed! (took {duration})")
+    
+    return train_with_predictions, val_with_predictions
+

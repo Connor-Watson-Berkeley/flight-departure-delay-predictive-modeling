@@ -21,13 +21,19 @@ from datetime import datetime, timedelta
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 
-# Load module from our Databricks repo
+# Load modules from our Databricks repo
 import importlib.util
 
 flight_lineage_features_path = "/Workspace/Shared/Team 4_2/flight-departure-delay-predictive-modeling/notebooks/Feature Engineering/flight_lineage_features.py"
 spec = importlib.util.spec_from_file_location("flight_lineage_features", flight_lineage_features_path)
 flight_lineage_features = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(flight_lineage_features)
+
+precompute_features_path = "/Workspace/Shared/Team 4_2/flight-departure-delay-predictive-modeling/notebooks/Feature Engineering/precompute_features.py"
+spec = importlib.util.spec_from_file_location("precompute_features", precompute_features_path)
+precompute_features = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(precompute_features)
+# Note: precompute_features.py now imports graph_features and meta_model_estimator directly
 
 
 # -------------------------
@@ -47,6 +53,11 @@ N_FOLDS = 3              # CV folds
 CREATE_TEST_FOLD = True  # adds one final test period
 WRITE_MODE = "overwrite"
 VERBOSE = True
+
+# Feature precomputation settings
+PRECOMPUTE_GRAPH_FEATURES = True  # Precompute graph features (PageRank)
+PRECOMPUTE_META_MODELS = True     # Precompute meta-model predictions
+META_MODEL_IDS = ["RF_1"]         # List of meta-model identifiers (e.g., ["RF_1", "RF_2", "XGB_1"])
 
 
 # -------------------------
@@ -135,6 +146,16 @@ def create_sliding_window_folds(
             (F.col(date_col) <  F.lit(v_end.strftime("%Y-%m-%d")))
         )
 
+        # Add precomputed features (graph + meta-models) if enabled
+        if PRECOMPUTE_GRAPH_FEATURES or PRECOMPUTE_META_MODELS:
+            train_df, val_df = precompute_features.add_precomputed_features(
+                train_df, val_df,
+                model_ids=META_MODEL_IDS,
+                compute_graph=PRECOMPUTE_GRAPH_FEATURES,
+                compute_meta_models=PRECOMPUTE_META_MODELS,
+                verbose=verbose
+            )
+        
         folds.append((train_df, val_df))
 
         if verbose:
@@ -157,6 +178,16 @@ def create_sliding_window_folds(
             (F.col(date_col) <= F.lit(test_end.strftime("%Y-%m-%d")))
         )
 
+        # Add precomputed features (graph + meta-models) if enabled
+        if PRECOMPUTE_GRAPH_FEATURES or PRECOMPUTE_META_MODELS:
+            combined_train, test_df = precompute_features.add_precomputed_features(
+                combined_train, test_df,
+                model_ids=META_MODEL_IDS,
+                compute_graph=PRECOMPUTE_GRAPH_FEATURES,
+                compute_meta_models=PRECOMPUTE_META_MODELS,
+                verbose=verbose
+            )
+        
         folds.append((combined_train, test_df))
 
         if verbose:

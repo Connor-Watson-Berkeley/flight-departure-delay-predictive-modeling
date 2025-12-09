@@ -12,6 +12,201 @@ from graphframes import GraphFrame
 from datetime import datetime
 
 
+# -------------------------
+# REUSABLE GRAPH COMPUTATION FUNCTION
+# -------------------------
+def compute_pagerank_features(train_df, val_df, 
+                              origin_col="origin", dest_col="dest",
+                              reset_probability=0.15, max_iter=50,
+                              checkpoint_dir="dbfs:/tmp/graphframes_checkpoint",
+                              verbose=True):
+    """
+    Compute PageRank features on training data and join to both train and val DataFrames.
+    
+    This function is designed for precomputing graph features during fold creation.
+    It computes PageRank on training data only (CV-safe) and applies to both train and val.
+    
+    Args:
+        train_df: Training DataFrame (used to build graph)
+        val_df: Validation/test DataFrame (gets graph features joined)
+        origin_col: Column name for origin airport
+        dest_col: Column name for destination airport
+        reset_probability: PageRank reset probability (default 0.15)
+        max_iter: Maximum PageRank iterations (default 50, higher since we only compute once)
+        checkpoint_dir: Spark checkpoint directory for GraphFrames
+        verbose: Whether to print progress messages
+    
+    Returns:
+        tuple: (train_df_with_features, val_df_with_features) both with graph features joined
+    """
+    if verbose:
+        start_time = datetime.now()
+        timestamp = start_time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] Computing graph features (train: {train_df.count():,} rows)...")
+    
+    # Set checkpoint directory
+    spark = SparkSession.builder.getOrCreate()
+    sc = spark.sparkContext
+    sc.setCheckpointDir(checkpoint_dir)
+    
+    # Build graph from training data only (CV-safe)
+    edges = (
+        train_df
+        .select(origin_col, dest_col)
+        .filter(
+            col(origin_col).isNotNull() & 
+            col(dest_col).isNotNull()
+        )
+        .groupBy(origin_col, dest_col)
+        .count()
+        .withColumnRenamed(origin_col, "src")
+        .withColumnRenamed(dest_col, "dst")
+        .withColumnRenamed("count", "weight")
+    )
+    
+    src_airports = edges.select(col("src").alias("id")).distinct()
+    dst_airports = edges.select(col("dst").alias("id")).distinct()
+    vertices = src_airports.union(dst_airports).distinct()
+    
+    g = GraphFrame(vertices, edges)
+    
+    # Compute unweighted PageRank
+    edges_unweighted = edges.select("src", "dst")
+    g_unweighted = GraphFrame(g.vertices, edges_unweighted)
+    pagerank_unweighted = g_unweighted.pageRank(
+        resetProbability=reset_probability,
+        maxIter=max_iter
+    )
+    
+    # Compute weighted PageRank (using duplication workaround)
+    edges_weighted = (
+        edges
+        .withColumn("seq", F.sequence(F.lit(0), col("weight").cast("int") - 1))
+        .select("src", "dst", F.explode("seq").alias("_"))
+        .select("src", "dst")
+    )
+    g_weighted = GraphFrame(g.vertices, edges_weighted)
+    pagerank_weighted = g_weighted.pageRank(
+        resetProbability=reset_probability,
+        maxIter=max_iter
+    )
+    
+    # Combine PageRank scores
+    pr_unw = pagerank_unweighted.vertices.select(
+        col("id").alias("airport"),
+        col("pagerank").alias("pagerank_unweighted")
+    )
+    pr_w = pagerank_weighted.vertices.select(
+        col("id").alias("airport"),
+        col("pagerank").alias("pagerank_weighted")
+    )
+    pagerank_scores = pr_unw.join(pr_w, "airport", "outer")
+    
+    # Broadcast for efficient joins
+    broadcast_scores = broadcast(pagerank_scores)
+    
+    # Join to train_df
+    train_with_features = (
+        train_df
+        .join(broadcast_scores, col(origin_col) == col("airport"), "left")
+        .withColumnRenamed("pagerank_weighted", "origin_pagerank_weighted")
+        .withColumnRenamed("pagerank_unweighted", "origin_pagerank_unweighted")
+        .drop("airport")
+        .join(broadcast_scores, col(dest_col) == col("airport"), "left")
+        .withColumnRenamed("pagerank_weighted", "dest_pagerank_weighted")
+        .withColumnRenamed("pagerank_unweighted", "dest_pagerank_unweighted")
+        .drop("airport")
+    )
+    
+    # Join to val_df
+    val_with_features = (
+        val_df
+        .join(broadcast_scores, col(origin_col) == col("airport"), "left")
+        .withColumnRenamed("pagerank_weighted", "origin_pagerank_weighted")
+        .withColumnRenamed("pagerank_unweighted", "origin_pagerank_unweighted")
+        .drop("airport")
+        .join(broadcast_scores, col(dest_col) == col("airport"), "left")
+        .withColumnRenamed("pagerank_weighted", "dest_pagerank_weighted")
+        .withColumnRenamed("pagerank_unweighted", "dest_pagerank_unweighted")
+        .drop("airport")
+    )
+    
+    # Add prev_flight graph features if prev_flight columns exist
+    if "prev_flight_origin" in train_with_features.columns:
+        train_with_features = (
+            train_with_features
+            .join(broadcast_scores, col("prev_flight_origin") == col("airport"), "left")
+            .withColumnRenamed("pagerank_weighted", "prev_flight_origin_pagerank_weighted")
+            .withColumnRenamed("pagerank_unweighted", "prev_flight_origin_pagerank_unweighted")
+            .drop("airport")
+        )
+        val_with_features = (
+            val_with_features
+            .join(broadcast_scores, col("prev_flight_origin") == col("airport"), "left")
+            .withColumnRenamed("pagerank_weighted", "prev_flight_origin_pagerank_weighted")
+            .withColumnRenamed("pagerank_unweighted", "prev_flight_origin_pagerank_unweighted")
+            .drop("airport")
+        )
+    
+    if "prev_flight_dest" in train_with_features.columns:
+        train_with_features = (
+            train_with_features
+            .join(broadcast_scores, col("prev_flight_dest") == col("airport"), "left")
+            .withColumnRenamed("pagerank_weighted", "prev_flight_dest_pagerank_weighted")
+            .withColumnRenamed("pagerank_unweighted", "prev_flight_dest_pagerank_unweighted")
+            .drop("airport")
+        )
+        val_with_features = (
+            val_with_features
+            .join(broadcast_scores, col("prev_flight_dest") == col("airport"), "left")
+            .withColumnRenamed("pagerank_weighted", "prev_flight_dest_pagerank_weighted")
+            .withColumnRenamed("pagerank_unweighted", "prev_flight_dest_pagerank_unweighted")
+            .drop("airport")
+        )
+    
+    # Fill NULL PageRank values with 0
+    pagerank_cols = [
+        "origin_pagerank_weighted", "origin_pagerank_unweighted",
+        "dest_pagerank_weighted", "dest_pagerank_unweighted"
+    ]
+    if "prev_flight_origin_pagerank_weighted" in train_with_features.columns:
+        pagerank_cols.extend([
+            "prev_flight_origin_pagerank_weighted", "prev_flight_origin_pagerank_unweighted"
+        ])
+    if "prev_flight_dest_pagerank_weighted" in train_with_features.columns:
+        pagerank_cols.extend([
+            "prev_flight_dest_pagerank_weighted", "prev_flight_dest_pagerank_unweighted"
+        ])
+    
+    fill_dict = {col_name: 0.0 for col_name in pagerank_cols}
+    train_with_features = train_with_features.fillna(fill_dict)
+    val_with_features = val_with_features.fillna(fill_dict)
+    
+    # Safety check: Validate that graph features were successfully joined
+    if verbose:
+        # Check for missing airports (filled with 0.0)
+        train_missing = train_with_features.filter(
+            col("origin_pagerank_weighted") == 0.0
+        ).count()
+        val_missing = val_with_features.filter(
+            col("origin_pagerank_weighted") == 0.0
+        ).count()
+        train_total = train_with_features.count()
+        val_total = val_with_features.count()
+        
+        if train_missing > 0 or val_missing > 0:
+            print(f"  ⚠ Warning: {train_missing:,}/{train_total:,} train rows and {val_missing:,}/{val_total:,} val rows have missing airports (filled with 0.0)")
+            if val_missing > val_total * 0.1:  # More than 10% missing
+                print(f"  ⚠ WARNING: High percentage of missing airports in validation data! This may indicate data issues.")
+        
+        end_time = datetime.now()
+        duration = end_time - start_time
+        timestamp = end_time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] ✓ Graph features computed! (took {duration})")
+    
+    return train_with_features, val_with_features
+
+
 class GraphFeaturesModel(Model):
     """Model returned by GraphFeaturesEstimator after fitting"""
     
@@ -27,9 +222,25 @@ class GraphFeaturesModel(Model):
         Optimizations:
         - Broadcasts PageRank scores (small lookup table ~200 airports) for faster joins
         - PageRank scores are already cached from fit() for reuse across multiple transforms
+        - If pagerank_scores is None, assumes features are already present (pass-through mode)
+        
+        Pass-through Mode (pagerank_scores=None):
+        - If features exist: Returns DataFrame unchanged (maximum efficiency, no-op)
+        - If features missing: Raises error (safety check)
+        
+        Normal Mode (pagerank_scores not None):
+        - Joins PageRank features normally (backwards compatible behavior)
         """
+        # Pass-through mode: features already exist (precomputed in split.py)
         if self.pagerank_scores is None:
-            raise ValueError("Model must be fitted before transform()")
+            # Verify required features exist
+            required = ["origin_pagerank_weighted", "origin_pagerank_unweighted",
+                       "dest_pagerank_weighted", "dest_pagerank_unweighted"]
+            if all(f in df.columns for f in required):
+                return df  # Features already present, no-op (maximum efficiency)
+            else:
+                raise ValueError("Graph features not found and model has no pagerank_scores. "
+                               "Either precompute features or fit the model first.")
         
         # Broadcast PageRank scores for efficient joins (small lookup table ~200 airports)
         # This avoids shuffling the large DataFrame and speeds up joins significantly
@@ -147,7 +358,7 @@ class GraphFeaturesEstimator(Estimator):
                  origin_col="origin",
                  dest_col="dest",
                  reset_probability=0.15,
-                 max_iter=10,
+                 max_iter=50,
                  checkpoint_dir="dbfs:/tmp/graphframes_checkpoint"):
         super(GraphFeaturesEstimator, self).__init__()
         self.origin_col = origin_col
@@ -193,7 +404,33 @@ class GraphFeaturesEstimator(Estimator):
         return edges_weighted
     
     def _fit(self, df):
-        """Build graph from training data and compute PageRank scores"""
+        """
+        Build graph from training data and compute PageRank scores.
+        
+        If graph features already exist in the DataFrame, skips computation and returns a pass-through model.
+        This allows precomputed graph features (e.g., from split.py) to be used without recomputation.
+        
+        Backwards Compatible: If features don't exist, computes them normally (existing behavior).
+        Maximum Efficiency: If features exist, returns pass-through model (no computation, no-op in transform).
+        """
+        # Check if graph features already exist
+        required_features = [
+            "origin_pagerank_weighted", "origin_pagerank_unweighted",
+            "dest_pagerank_weighted", "dest_pagerank_unweighted"
+        ]
+        existing_features = [f for f in required_features if f in df.columns]
+        
+        if len(existing_features) == len(required_features):
+            # All required features exist - return pass-through model (maximum efficiency)
+            # This model will do no-op in _transform() if features are present
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Graph features already present, skipping computation")
+            return GraphFeaturesModel(
+                pagerank_scores=None,  # None indicates pass-through mode (no computation)
+                origin_col=self.origin_col,
+                dest_col=self.dest_col
+            )
+        
+        # Graph features don't exist - compute them
         start_time = datetime.now()
         timestamp = start_time.strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{timestamp}] Generating graph features...")
