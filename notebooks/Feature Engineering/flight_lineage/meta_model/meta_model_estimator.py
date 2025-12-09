@@ -493,8 +493,17 @@ class MetaModelEstimator(Estimator):
             ]
         
         # Filter to only include features that exist in DataFrame
-        available_categorical = [f for f in categorical_features if f in df.columns]
-        available_numerical = [f for f in numerical_features if f in df.columns]
+        # If use_preprocessed_features=True, check for processed feature names (_VEC, _IMPUTED)
+        # Otherwise, check for original feature names
+        if self.use_preprocessed_features:
+            # Check for processed feature names
+            available_cols = set(df.columns)
+            available_categorical = [f for f in categorical_features if f"{f}_VEC" in available_cols]
+            available_numerical = [f for f in numerical_features if f"{f}_IMPUTED" in available_cols]
+        else:
+            # Check for original feature names
+            available_categorical = [f for f in categorical_features if f in df.columns]
+            available_numerical = [f for f in numerical_features if f in df.columns]
         
         # Validate graph features are available (target-specific)
         if target_name == "air_time":
