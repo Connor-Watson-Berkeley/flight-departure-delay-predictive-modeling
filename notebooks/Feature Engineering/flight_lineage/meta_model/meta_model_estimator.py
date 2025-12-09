@@ -46,6 +46,9 @@ class MetaModelModel(Model):
                 df_with_predictions = df_with_predictions.withColumnRenamed(
                     "prediction", "predicted_prev_flight_air_time"
                 )
+            # Drop intermediate "features" column to avoid conflicts with next meta-model
+            if "features" in df_with_predictions.columns:
+                df_with_predictions = df_with_predictions.drop("features")
         
         # Compute taxi time if needed (for taxi_time meta-model or as fallback)
         if "prev_flight_taxi_time" not in df_with_predictions.columns:
@@ -66,6 +69,9 @@ class MetaModelModel(Model):
                 df_with_predictions = df_with_predictions.withColumnRenamed(
                     "prediction", "predicted_prev_flight_taxi_time"
                 )
+            # Drop intermediate "features" column to avoid conflicts with next meta-model
+            if "features" in df_with_predictions.columns:
+                df_with_predictions = df_with_predictions.drop("features")
         
         # Predict total duration
         if self._total_duration_pipeline:
@@ -81,6 +87,9 @@ class MetaModelModel(Model):
                 df_with_predictions = df_with_predictions.withColumnRenamed(
                     "prediction", "predicted_prev_flight_total_duration"
                 )
+            # Drop intermediate "features" column (no more meta-models after this)
+            if "features" in df_with_predictions.columns:
+                df_with_predictions = df_with_predictions.drop("features")
         
         # Impute NULL predictions (for first flights or jumps)
         df_with_predictions = df_with_predictions.withColumn(
@@ -124,8 +133,8 @@ class MetaModelEstimator(Estimator):
     
     def __init__(self,
                  num_trees=50,
-                 max_depth=10,
-                 min_instances_per_node=10,
+                 max_depth=20,  # Increased for high-cardinality categoricals (3000+ routes)
+                 min_instances_per_node=20,  # Increased to prevent overfitting with deeper trees
                  use_preprocessed_features=False):
         super(MetaModelEstimator, self).__init__()
         self.num_trees = num_trees
@@ -157,12 +166,48 @@ class MetaModelEstimator(Estimator):
         
         print(f"  Training on {train_with_prev.count()} rows with previous flight data")
         
+        # Debug: Check what columns are available
+        available_cols = set(train_with_prev.columns)
+        prev_flight_cols = [col for col in available_cols if col.startswith('prev_flight_')]
+        print(f"  Debug: Found {len(prev_flight_cols)} prev_flight_* columns")
+        critical_cols = [
+            'prev_flight_air_time',
+            'prev_flight_taxi_in',
+            'prev_flight_taxi_out',
+            'prev_flight_actual_elapsed_time'
+        ]
+        for col_name in critical_cols:
+            if col_name in available_cols:
+                non_null_count = train_with_prev.filter(col(col_name).isNotNull()).count()
+                print(f"    ✓ {col_name}: exists ({non_null_count} non-null rows)")
+            else:
+                print(f"    ✗ {col_name}: MISSING")
+        
         # Train meta-models
         air_time_pipeline = self._train_air_time_model(train_with_prev)
         taxi_time_pipeline = self._train_taxi_time_model(train_with_prev)
         total_duration_pipeline = self._train_total_duration_model(train_with_prev)
         
-        print(f"✓ Meta-model training complete!")
+        # Debug: Count how many actually trained
+        trained_count = sum([
+            1 if air_time_pipeline is not None else 0,
+            1 if taxi_time_pipeline is not None else 0,
+            1 if total_duration_pipeline is not None else 0
+        ])
+        print(f"✓ Meta-model training complete! ({trained_count}/3 models trained)")
+        if trained_count < 3:
+            print(f"  ⚠ Warning: Only {trained_count} out of 3 meta-models trained successfully.")
+            if air_time_pipeline is None:
+                print(f"    - Air time meta-model: FAILED")
+            if taxi_time_pipeline is None:
+                print(f"    - Taxi time meta-model: FAILED")
+            if total_duration_pipeline is None:
+                print(f"    - Total duration meta-model: FAILED")
+        else:
+            print(f"  ✓ All 3 meta-models trained successfully:")
+            print(f"    - Air time meta-model: ✓")
+            print(f"    - Taxi time meta-model: ✓")
+            print(f"    - Total duration meta-model: ✓")
         
         return MetaModelModel(
             air_time_pipeline=air_time_pipeline,
@@ -172,89 +217,174 @@ class MetaModelEstimator(Estimator):
     
     def _get_meta_model_features(self, df, target_name):
         """
-        Define features for meta-models based on target variable.
+        Intelligently define features for meta-models based on target variable.
         
-        Uses comprehensive covariates as described in CONDITIONAL_EXPECTED_VALUES_DESIGN.md:
-        - Weather variables (previous flight origin/dest)
-        - Temporal features (month, day_of_week, hour_of_day, day_of_month)
-        - Route characteristics (previous flight route)
-        - Carrier and location (state-level)
-        - Scheduled flight characteristics
+        Uses domain knowledge to select the most predictive features for each target:
+        - Air Time: Distance (CRITICAL), route (origin→dest), month (jet streams), weather
+        - Taxi Time: Time blocks, airport-level features, weather
+        - Total Duration: Combination of air + taxi features
+        
+        Note: Random Forest handles high-cardinality categoricals (3000+ routes) well,
+        so we include origin→dest route directly for air_time predictions.
+        
+        Default max_depth=20 allows trees to make route-specific splits while min_instances_per_node=20
+        prevents overfitting. Uses origin + dest + distance to capture route patterns without
+        the high cardinality (3000+) of explicit route combinations.
         
         Returns:
         - categorical_features: List of categorical feature names
         - numerical_features: List of numerical feature names
         """
-        # Categorical features
-        categorical_features = [
-            # Carrier and location (state-level to avoid high cardinality)
-            'prev_flight_op_carrier',
-            'prev_flight_origin_state_abr',
-            'prev_flight_dest_state_abr',
-            # Temporal features
-            'prev_flight_day_of_week',
-            'prev_flight_month',
-        ]
+        # Initialize with base features
+        categorical_features = []
+        numerical_features = []
         
-        # Numerical features - comprehensive set
-        numerical_features = [
-            # Previous flight scheduled characteristics
-            'prev_flight_crs_elapsed_time',
-            'prev_flight_distance',
-            'prev_flight_crs_dep_time',  # Hour/minute as numerical
-            'prev_flight_crs_arr_time',  # Hour/minute as numerical
-            
-            # Weather at previous flight origin (comprehensive set)
-            'prev_flight_origin_hourlyprecipitation',
-            'prev_flight_origin_hourlysealevelpressure',
-            'prev_flight_origin_hourlyaltimetersetting',
-            'prev_flight_origin_hourlywetbulbtemperature',
-            'prev_flight_origin_hourlystationpressure',
-            'prev_flight_origin_hourlywinddirection',
-            'prev_flight_origin_hourlyrelativehumidity',
-            'prev_flight_origin_hourlywindspeed',
-            'prev_flight_origin_hourlydewpointtemperature',
-            'prev_flight_origin_hourlydrybulbtemperature',
-            'prev_flight_origin_hourlyvisibility',
-            
-            # Weather at previous flight destination
-            'prev_flight_dest_hourlyprecipitation',
-            'prev_flight_dest_hourlysealevelpressure',
-            'prev_flight_dest_hourlyaltimetersetting',
-            'prev_flight_dest_hourlywetbulbtemperature',
-            'prev_flight_dest_hourlystationpressure',
-            'prev_flight_dest_hourlywinddirection',
-            'prev_flight_dest_hourlyrelativehumidity',
-            'prev_flight_dest_hourlywindspeed',
-            'prev_flight_dest_hourlydewpointtemperature',
-            'prev_flight_dest_hourlydrybulbtemperature',
-            'prev_flight_dest_hourlyvisibility',
-            
-            # Airport characteristics (if available)
-            'prev_flight_origin_elevation',
-            'prev_flight_dest_elevation',
-            
-            # Temporal features (numerical)
-            'prev_flight_day_of_month',
-            # Note: hour_of_day can be derived from crs_dep_time or dep_time_blk
-        ]
-        
-        # Target-specific features
+        # Target-specific feature selection
         if target_name == "air_time":
-            # Air time specific: route characteristics
-            # Could add route-level aggregations if available
-            pass
+            # AIR TIME: Highly dependent on distance, origin/dest, and seasonal patterns (jet streams)
+            # Key insight: Distance + origin + dest can approximate route-specific patterns
+            # without the 3000+ cardinality of explicit route combinations
+            categorical_features = [
+                # Airport features - capture route-specific patterns without high cardinality
+                'prev_flight_origin',        # Origin airport (~200 categories) - affects departure routing
+                'prev_flight_dest',          # Destination airport (~200 categories) - affects arrival routing
+                # Random Forest will learn origin×dest interactions implicitly through tree splits
+                
+                # Month - CRITICAL for jet streams and seasonal wind patterns
+                'prev_flight_month',
+                
+                # Carrier (minor effect, but some airlines have different speeds/routes)
+                'prev_flight_op_carrier',
+                
+                # State-level (lower cardinality fallback for sparse routes)
+                'prev_flight_origin_state_abr',
+                'prev_flight_dest_state_abr',
+            ]
+            
+            numerical_features = [
+                # DISTANCE - MOST CRITICAL PREDICTOR (captures route length)
+                'prev_flight_distance',
+                
+                # Scheduled elapsed time (correlates with distance)
+                'prev_flight_crs_elapsed_time',
+                
+                # Wind patterns affect air time (jet streams, headwinds/tailwinds)
+                # Origin wind at departure
+                'prev_flight_origin_hourlywindspeed',
+                'prev_flight_origin_hourlywinddirection',
+                # Destination wind at arrival
+                'prev_flight_dest_hourlywindspeed',
+                'prev_flight_dest_hourlywinddirection',
+                
+                # Weather affecting flight conditions
+                'prev_flight_origin_hourlyvisibility',
+                'prev_flight_dest_hourlyvisibility',
+                'prev_flight_origin_hourlyprecipitation',
+                'prev_flight_dest_hourlyprecipitation',
+                
+                # Pressure/altitude effects
+                'prev_flight_origin_hourlysealevelpressure',
+                'prev_flight_dest_hourlysealevelpressure',
+                
+                # Airport elevation (affects takeoff/landing, slight impact on air time)
+                'prev_flight_origin_elevation',
+                'prev_flight_dest_elevation',
+                
+                # Temporal features (numerical)
+                'prev_flight_day_of_month',  # Minor effect
+                'prev_flight_crs_dep_time',  # Time of day (affects traffic/altitude)
+            ]
+            
         elif target_name == "taxi_time":
-            # Taxi time specific: time blocks for congestion
-            categorical_features.extend([
-                'prev_flight_dep_time_blk',
-                'prev_flight_arr_time_blk',
-            ])
-            # Add airport congestion indicators if available
+            # TAXI TIME: Dependent on airport congestion, time of day, weather
+            categorical_features = [
+                # Airport-level (taxi time is airport-specific, not route-specific)
+                'prev_flight_origin',        # Origin airport (taxi-out)
+                'prev_flight_dest',          # Destination airport (taxi-in)
+                
+                # Time blocks - CRITICAL for congestion patterns
+                'prev_flight_dep_time_blk',  # Departure time block (affects taxi-out)
+                'prev_flight_arr_time_blk',  # Arrival time block (affects taxi-in)
+                
+                # Day of week (weekday vs weekend patterns)
+                'prev_flight_day_of_week',
+                
+                # Month (seasonal patterns, holidays)
+                'prev_flight_month',
+                
+                # Carrier (some airlines have priority/preferred gates)
+                'prev_flight_op_carrier',
+                
+                # State-level (lower cardinality)
+                'prev_flight_origin_state_abr',
+                'prev_flight_dest_state_abr',
+            ]
+            
+            numerical_features = [
+                # Weather at airports - affects ground operations
+                'prev_flight_origin_hourlyprecipitation',  # Rain/snow slows taxi
+                'prev_flight_origin_hourlyvisibility',     # Low visibility slows operations
+                'prev_flight_origin_hourlywindspeed',      # High winds affect taxi
+                
+                'prev_flight_dest_hourlyprecipitation',
+                'prev_flight_dest_hourlyvisibility',
+                'prev_flight_dest_hourlywindspeed',
+                
+                # Airport characteristics
+                'prev_flight_origin_elevation',
+                'prev_flight_dest_elevation',
+                
+                # Temporal (numerical)
+                'prev_flight_day_of_month',
+                'prev_flight_crs_dep_time',
+                'prev_flight_crs_arr_time',
+            ]
+            
         elif target_name == "total_duration":
-            # Total duration: combination of air and taxi
-            # Could add both air_time and taxi_time components if predicting separately
-            pass
+            # TOTAL DURATION: Combination of air time + taxi time
+            # Use features from both, but focus on strongest predictors
+            categorical_features = [
+                # Airport features (air time component) - origin + dest + distance capture route patterns
+                'prev_flight_origin',        # Origin airport (~200 categories)
+                'prev_flight_dest',          # Destination airport (~200 categories)
+                
+                # Temporal (affects both air and taxi)
+                'prev_flight_month',           # Jet streams (air) + seasonal patterns (taxi)
+                'prev_flight_day_of_week',     # Weekday patterns
+                'prev_flight_dep_time_blk',    # Time blocks (affects both)
+                'prev_flight_arr_time_blk',
+                
+                # Carrier and location
+                'prev_flight_op_carrier',
+                'prev_flight_origin_state_abr',
+                'prev_flight_dest_state_abr',
+            ]
+            
+            numerical_features = [
+                # Distance - CRITICAL for total duration (air time component)
+                'prev_flight_distance',
+                'prev_flight_crs_elapsed_time',  # Scheduled total time
+                
+                # Weather (affects both air and taxi)
+                'prev_flight_origin_hourlyprecipitation',
+                'prev_flight_origin_hourlyvisibility',
+                'prev_flight_origin_hourlywindspeed',
+                'prev_flight_origin_hourlywinddirection',
+                
+                'prev_flight_dest_hourlyprecipitation',
+                'prev_flight_dest_hourlyvisibility',
+                'prev_flight_dest_hourlywindspeed',
+                'prev_flight_dest_hourlywinddirection',
+                
+                # Airport characteristics
+                'prev_flight_origin_elevation',
+                'prev_flight_dest_elevation',
+                
+                # Temporal
+                'prev_flight_day_of_month',
+                'prev_flight_crs_dep_time',
+                'prev_flight_crs_arr_time',
+            ]
         
         # Filter to only include features that exist in DataFrame
         available_categorical = [f for f in categorical_features if f in df.columns]
