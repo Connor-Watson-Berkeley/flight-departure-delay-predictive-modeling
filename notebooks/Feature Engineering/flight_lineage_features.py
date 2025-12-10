@@ -268,6 +268,69 @@ def _add_previous_flight_data(df, window_spec):
     df = df.withColumn('prev_flight_cancelled', F.lag('cancelled', 1).over(window_spec))
     df = df.withColumn('prev_flight_diverted', F.lag('diverted', 1).over(window_spec))
     
+    # Previous Flight Weather Features (CRITICAL for predictive modeling)
+    # These capture weather conditions during the previous flight, which are highly predictive
+    # for current flight delays, air time, and duration predictions
+    # NOTE: These will only be available if weather data is joined (e.g., OTPW dataset)
+    # If columns don't exist, they will be NULL (handled gracefully by imputation)
+    
+    # Hourly Weather Variables (most granular, most predictive)
+    weather_cols_to_lag = [
+        # Core hourly weather (most important for flight operations)
+        'hourlyprecipitation',
+        'hourlywindspeed',
+        'hourlywinddirection',
+        'hourlyvisibility',
+        'hourlydrybulbtemperature',
+        'hourlydewpointtemperature',
+        'hourlyrelativehumidity',
+        'hourlysealevelpressure',
+        'hourlystationpressure',
+        'hourlyaltimetersetting',
+        'hourlywetbulbtemperature',
+        'hourlywindgustspeed',
+        'hourlyskyconditions',
+        'hourlypresentweathertype',
+        'hourlypressurechange',
+        'hourlypressuretendency',
+        
+        # Daily Weather Variables (aggregate conditions)
+        'dailyprecipitation',
+        'dailyaveragewindspeed',
+        'dailypeakwindspeed',
+        'dailymaximumdrybulbtemperature',
+        'dailyminimumdrybulbtemperature',
+        'dailyaveragedrybulbtemperature',
+        'dailysnowfall',
+        'dailysnowdepth',
+        'dailyweather',
+        
+        # Monthly Weather Variables (long-term patterns)
+        'monthlyaveragerh',
+        'monthlydeparturefromnormalaveragetemperature',
+    ]
+    
+    # Only lag weather columns that actually exist in the DataFrame
+    # This allows the function to work with or without weather data
+    existing_weather_cols = [col for col in weather_cols_to_lag if col in df.columns]
+    missing_weather_cols = [col for col in weather_cols_to_lag if col not in df.columns]
+    
+    if missing_weather_cols:
+        print(f"  ⚠ Note: {len(missing_weather_cols)} weather columns not found (will be skipped):")
+        print(f"    Missing: {missing_weather_cols[:10]}{'...' if len(missing_weather_cols) > 10 else ''}")
+        print(f"    This is expected if weather data is not joined (e.g., CUSTOM dataset without weather)")
+        print(f"    Previous flight weather features will only be available for flights with weather data")
+    
+    if existing_weather_cols:
+        print(f"  ✓ Lagging {len(existing_weather_cols)} weather columns as previous flight features...")
+        for weather_col in existing_weather_cols:
+            prev_col_name = f'prev_flight_{weather_col}'
+            df = df.withColumn(prev_col_name, F.lag(weather_col, 1).over(window_spec))
+        print(f"    Created {len(existing_weather_cols)} prev_flight_* weather features")
+    else:
+        print(f"  ⚠ No weather columns found - previous flight weather features will not be available")
+        print(f"    This is expected if weather data is not joined")
+    
     return df
 
 
