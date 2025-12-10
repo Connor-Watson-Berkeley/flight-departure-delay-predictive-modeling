@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-split.py (CUSTOM only, real paths, processes both 3M and 12M)
+split.py (CUSTOM only, real paths, processes 3M, 12M, and 60M)
 
 Reads:
   3M  from dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_3m
   12M from dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_2015
+  60M from dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_60m
 
 Writes folds to:
   dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed
@@ -36,7 +37,10 @@ spec.loader.exec_module(flight_lineage_features)
 DATASETS = {
     "3M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_3m",
     "12M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_2015",
-    "60M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_/"
+    # 60M: Created by Custom Join (full).ipynb with data_version="60m" for 2015-2019 data
+    # The Custom Join notebook filters to 2015-2019 at the beginning (Cell 13) for efficiency
+    # "60M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_60m"
+    "60M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_60M"
 }
 
 OUTPUT_FOLDER = "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed"
@@ -215,7 +219,7 @@ if __name__ == "__main__":
         
         # Filter datasets to 2015-2019 (2019 is test set year)
         # All versions should be filtered to this range for consistency
-        # Note: 3M and 12M may already be filtered at source, but we filter anyway to ensure consistency
+        # Note: 60M is already filtered in Custom Join notebook, but we filter anyway to ensure consistency
         initial_count = df.count()
         df = df.filter(
             (F.col(DATE_COL) >= F.lit("2015-01-01")) & 
@@ -227,7 +231,7 @@ if __name__ == "__main__":
             print(f"🔍 Filtered to 2015-2019: Removed {removed:,} rows outside range ({removed/initial_count*100:.2f}%)")
         print(f"  Remaining: {filtered_count:,} rows")
 
-        # Joins in flight lineage features
+        # Add flight lineage features
         df = flight_lineage_features.add_flight_lineage_features(df)
 
         folds = create_sliding_window_folds(

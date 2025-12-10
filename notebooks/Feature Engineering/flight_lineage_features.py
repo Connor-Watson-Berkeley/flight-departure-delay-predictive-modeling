@@ -61,6 +61,12 @@ def add_flight_lineage_features(df):
         - required_time_prev_flight_minutes: Expected air_time + expected_turnover_time (convenience feature)
         - impossible_on_time_flag: Boolean flag when required_time > available_time
         - safe_*: Safe versions of features with intelligent data leakage imputation
+          - safe_lineage_rotation_time_minutes: Safe rotation time
+          - safe_prev_departure_delay: Safe previous flight departure delay
+          - safe_prev_arrival_delay: Safe previous flight arrival delay
+          - safe_time_since_prev_arrival: Time between previous flight's arrival and prediction cutoff
+          - safe_required_time_prev_flight_minutes: Safe required time
+          - safe_impossible_on_time_flag: Safe impossible on-time flag
         - columns_with_data_leakage: Array of columns with data leakage
         - prediction_cutoff_timestamp: Cutoff timestamp for data leakage detection
     
@@ -187,6 +193,13 @@ def add_flight_lineage_features(df):
     print(f"    - required_time_prev_flight_minutes: Expected air_time + expected_turnover_time")
     print(f"      (Uses conditional expected values if available, otherwise scheduled times)")
     print(f"    - safe_required_time_prev_flight_minutes: Safe version (always data leakage-free)")
+    print(f"  Delay Features:")
+    print(f"    - safe_prev_departure_delay: Safe previous flight departure delay (handles data leakage)")
+    print(f"      Uses actual delay if available, or computes delay from cutoff timestamp if not yet departed")
+    print(f"    - safe_prev_arrival_delay: Safe previous flight arrival delay (handles data leakage)")
+    print(f"      Uses actual delay if available, or computes delay from cutoff timestamp if not yet arrived")
+    print(f"    - safe_time_since_prev_arrival: Time between previous flight's arrival and prediction cutoff")
+    print(f"      Uses actual arrival if available, or estimates based on scheduled arrival and cutoff")
     print(f"  Other Safe Features:")
     print(f"    - safe_impossible_on_time_flag: Safe binary flag (required_time > rotation_time)")
     print(f"\n⚠️  FEATURES WITH DATA LEAKAGE (Use with caution):")
@@ -538,6 +551,90 @@ def _compute_safe_features(df):
         ).otherwise(
             # Fallback to regular version if safe version unavailable
             col('lineage_rotation_time_minutes')
+        )
+    )
+    
+    # Compute safe previous flight departure delay
+    # Logic:
+    # (1) If previous flight already departed (actual_dep <= cutoff): use actual departure delay
+    # (2) If previous flight hasn't departed yet (actual_dep > cutoff):
+    #     - If scheduled_dep < cutoff: use (cutoff - scheduled_dep) in minutes (at least delayed until now)
+    #     - If scheduled_dep >= cutoff: use 0 (scheduled is in future, no delay yet)
+    # (3) Otherwise: fallback to 0 or imputed value
+    df = df.withColumn(
+        'safe_prev_departure_delay',
+        F.when(
+            # Case 1: Previous flight already departed (actual_dep <= cutoff) - use actual delay
+            (col('prev_flight_dep_delay').isNotNull()) & 
+            (~col('has_leakage_prev_flight_actual_dep_time')),  # No leakage = already departed
+            col('prev_flight_dep_delay')
+        ).otherwise(
+            # Case 2: Previous flight hasn't departed yet (actual_dep > cutoff or NULL)
+            F.when(
+                (col('prediction_cutoff_timestamp').isNotNull()) & 
+                (col('prev_flight_sched_dep_timestamp').isNotNull()),
+                F.when(
+                    # Scheduled departure is before cutoff: compute delay as (cutoff - scheduled_dep) in minutes
+                    col('prev_flight_sched_dep_timestamp') < col('prediction_cutoff_timestamp'),
+                    # Calculate difference in minutes: (cutoff - scheduled_dep)
+                    (F.unix_timestamp(col('prediction_cutoff_timestamp')) - 
+                     F.unix_timestamp(col('prev_flight_sched_dep_timestamp'))) / 60.0
+                ).otherwise(
+                    # Scheduled departure is after cutoff: no delay yet (scheduled is in future)
+                    F.lit(0.0)
+                )
+            ).otherwise(
+                # Fallback: if we can't compute, use 0 (no delay information available)
+                F.lit(0.0)
+            )
+        )
+    )
+    
+    # Convert previous flight's scheduled arrival to timestamp for comparison
+    df = df.withColumn(
+        'prev_flight_sched_arr_timestamp',
+        F.when(
+            (col('prev_flight_crs_arr_time').isNotNull()) & (col('prev_flight_fl_date').isNotNull()),
+            F.to_timestamp(
+                F.concat(col('prev_flight_fl_date'), F.lpad(col('prev_flight_crs_arr_time').cast('string'), 4, '0')),
+                'yyyy-MM-ddHHmm'
+            )
+        ).otherwise(None)
+    )
+    
+    # Compute safe previous flight arrival delay
+    # Logic:
+    # (1) If previous flight already arrived (actual_arr <= cutoff): use actual arrival delay
+    # (2) If previous flight hasn't arrived yet (actual_arr > cutoff):
+    #     - If scheduled_arr < cutoff: use (cutoff - scheduled_arr) in minutes (at least delayed until now)
+    #     - If scheduled_arr >= cutoff: use 0 (scheduled is in future, no delay yet)
+    # (3) Otherwise: fallback to 0 or imputed value
+    df = df.withColumn(
+        'safe_prev_arrival_delay',
+        F.when(
+            # Case 1: Previous flight already arrived (actual_arr <= cutoff) - use actual delay
+            (col('prev_flight_arr_delay').isNotNull()) & 
+            (~col('has_leakage_prev_flight_actual_arr_time')),  # No leakage = already arrived
+            col('prev_flight_arr_delay')
+        ).otherwise(
+            # Case 2: Previous flight hasn't arrived yet (actual_arr > cutoff or NULL)
+            F.when(
+                (col('prediction_cutoff_timestamp').isNotNull()) & 
+                (col('prev_flight_sched_arr_timestamp').isNotNull()),
+                F.when(
+                    # Scheduled arrival is before cutoff: compute delay as (cutoff - scheduled_arr) in minutes
+                    col('prev_flight_sched_arr_timestamp') < col('prediction_cutoff_timestamp'),
+                    # Calculate difference in minutes: (cutoff - scheduled_arr)
+                    (F.unix_timestamp(col('prediction_cutoff_timestamp')) - 
+                     F.unix_timestamp(col('prev_flight_sched_arr_timestamp'))) / 60.0
+                ).otherwise(
+                    # Scheduled arrival is after cutoff: no delay yet (scheduled is in future)
+                    F.lit(0.0)
+                )
+            ).otherwise(
+                # Fallback: if we can't compute, use 0 (no delay information available)
+                F.lit(0.0)
+            )
         )
     )
     
@@ -1041,6 +1138,62 @@ def _apply_imputation(df):
                        F.coalesce(col('impossible_on_time_flag'), F.lit(False)))
     df = df.withColumn('safe_impossible_on_time_flag',
                        F.coalesce(col('safe_impossible_on_time_flag'), col('impossible_on_time_flag')))
+    
+    # Compute safe_time_since_prev_arrival
+    # This measures the time between previous flight's arrival and the prediction cutoff
+    # Logic:
+    # (1) If actual prev arrival is before cutoff: use (cutoff - actual_arrival) in minutes
+    #     This is the actual time that has passed since arrival
+    # (2) If actual arrival is after cutoff (hasn't arrived yet):
+    #     - If scheduled arrival is before cutoff: use 0
+    #       Reason: Flight is delayed, earliest it can arrive is right now (at cutoff)
+    #       So time since arrival = 0 (it arrives right now, no time has passed yet)
+    #     - If scheduled arrival is after cutoff: use (cutoff - scheduled_arrival) in minutes (negative)
+    #       This is time until scheduled arrival (negative value)
+    df = df.withColumn(
+        'safe_time_since_prev_arrival',
+        F.when(
+            # Case 1: Previous flight already arrived (actual_arr <= cutoff)
+            (col('prev_flight_actual_arr_time').isNotNull()) & 
+            (col('prev_flight_fl_date').isNotNull()) &
+            (~col('has_leakage_prev_flight_actual_arr_time')),  # No leakage = already arrived
+            # Use (cutoff - actual_arrival) in minutes
+            (F.unix_timestamp(col('prediction_cutoff_timestamp')) - 
+             F.unix_timestamp(
+                 F.to_timestamp(
+                     F.concat(col('prev_flight_fl_date'), 
+                             F.lpad(col('prev_flight_actual_arr_time').cast('string'), 4, '0')),
+                     'yyyy-MM-ddHHmm'
+                 )
+             )) / 60.0
+        ).otherwise(
+            # Case 2: Previous flight hasn't arrived yet (actual_arr > cutoff or NULL)
+            F.when(
+                (col('prediction_cutoff_timestamp').isNotNull()) & 
+                (col('prev_flight_sched_arr_timestamp').isNotNull()),
+                F.when(
+                    # Scheduled arrival is before cutoff: use 0 (earliest it can arrive is right now)
+                    col('prev_flight_sched_arr_timestamp') < col('prediction_cutoff_timestamp'),
+                    F.lit(0.0)
+                ).otherwise(
+                    # Scheduled arrival is after cutoff: use (cutoff - scheduled_arrival) in minutes (negative)
+                    (F.unix_timestamp(col('prediction_cutoff_timestamp')) - 
+                     F.unix_timestamp(col('prev_flight_sched_arr_timestamp'))) / 60.0
+                )
+            ).otherwise(
+                # Fallback: if we can't compute, use 0
+                F.lit(0.0)
+            )
+        )
+    )
+    
+    # Impute safe delay features: for first flights (no previous flight), use 0 (no delay)
+    df = df.withColumn('safe_prev_departure_delay',
+                       F.coalesce(col('safe_prev_departure_delay'), F.lit(0.0)))
+    df = df.withColumn('safe_prev_arrival_delay',
+                       F.coalesce(col('safe_prev_arrival_delay'), F.lit(0.0)))
+    df = df.withColumn('safe_time_since_prev_arrival',
+                       F.coalesce(col('safe_time_since_prev_arrival'), F.lit(0.0)))
     
     df = df.drop('prev_flight_crs_dep_time_minutes')
     

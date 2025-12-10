@@ -3,221 +3,22 @@ graph_features.py - Graph-based feature engineering for flight delay prediction
 
 Provides GraphFeaturesEstimator for use in Spark ML pipelines.
 Computes PageRank features (weighted and unweighted) from flight network graph.
+
+RESTORED VERSION (Dec 2024):
+This file was restored to commit 3021702 (safe version before RDD implementation).
+This version uses GraphFrames for both weighted and unweighted PageRank.
+
+The broken preprocessing version is saved as graph_features_preprocessing_snapshot.py.
+The RDD implementation version (9814117) is available in git history.
+
+This version works with existing model pipelines and apply_engineered_features.py.
 """
 
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.functions import col, broadcast
 from pyspark.ml.base import Estimator, Model
-from pyspark.sql.types import FloatType
-from datetime import datetime
-from collections import defaultdict
 from graphframes import GraphFrame
-
-
-# -------------------------
-# RDD-BASED PAGERANK IMPLEMENTATION (FAST)
-# -------------------------
-def _init_graph_rdd(edges_df):
-    """
-    Initialize graph RDD from edges DataFrame.
-    Returns: RDD of (node_id, (score, edges_dict)) where edges_dict maps neighbor -> weight
-    
-    Follows the homework 5 pattern but adapted for DataFrame input.
-    """
-    # Get SparkContext from SparkSession (don't pass as parameter to avoid serialization issues)
-    spark = SparkSession.builder.getOrCreate()
-    sc = spark.sparkContext
-    
-    # Convert edges to RDD: (src, dst, weight)
-    # Handle both cases: weight column exists or defaults to 1
-    if 'weight' in edges_df.columns:
-        edges_rdd = edges_df.rdd.map(lambda row: (row.src, row.dst, int(row.weight)))
-    else:
-        edges_rdd = edges_df.rdd.map(lambda row: (row.src, row.dst, 1))
-    
-    # Build adjacency list: aggregate edges by source node
-    # For weighted PageRank: sum weights for duplicate edges
-    # Result: (node, {neighbor: total_weight})
-    adjacency = edges_rdd.map(lambda x: (x[0], {x[1]: x[2]})).reduceByKey(
-        lambda a, b: {k: a.get(k, 0) + b.get(k, 0) for k in set(a.keys()) | set(b.keys())}
-    )
-    
-    # Get all nodes (sources and destinations) to count N
-    all_nodes = edges_rdd.flatMap(lambda x: [x[0], x[1]]).distinct()
-    N = all_nodes.count()
-    initial_score = 1.0 / N if N > 0 else 0.0
-    initial_score_bc = sc.broadcast(initial_score)
-    
-    # Create graph RDD for nodes with edges: (node, (score, edges_dict))
-    graph_with_edges = adjacency.map(lambda x: (x[0], (initial_score_bc.value, x[1])))
-    
-    # Find dangling nodes (destinations that are not sources)
-    sources = adjacency.map(lambda x: x[0]).distinct()
-    destinations = edges_rdd.map(lambda x: x[1]).distinct()
-    dangling_nodes = destinations.subtract(sources).map(
-        lambda x: (x, (initial_score_bc.value, {}))
-    )
-    
-    # Combine all nodes
-    graph_rdd = graph_with_edges.union(dangling_nodes)
-    
-    return graph_rdd, N
-
-
-def _run_pagerank_rdd(graph_rdd, N, alpha=0.15, max_iter=10, verbose=True, initial_scores=None, tol=1e-4):
-    """
-    Run PageRank using RDD implementation (much faster than GraphFrames).
-    
-    Follows the homework 5 pattern but uses functional approach instead of accumulators.
-    Stops early if convergence is detected (change in scores < tolerance).
-    
-    Args:
-        graph_rdd: RDD of (node_id, (score, edges_dict))
-        N: Number of nodes
-        alpha: Reset probability (default 0.15)
-        max_iter: Maximum iterations (default 25, reasonable balance between accuracy and speed)
-        verbose: Print progress
-        initial_scores: Optional dict of {node_id: initial_score} for warm start (faster convergence)
-        tol: Convergence tolerance - stop if max change in scores < tol (default 1e-4)
-               Convergence is checked every 5 iterations (after iteration 5) to avoid expensive joins
-    
-    Returns:
-        RDD of (node_id, pagerank_score)
-    """
-    # Get SparkContext from SparkSession (don't pass as parameter to avoid serialization issues)
-    spark = SparkSession.builder.getOrCreate()
-    sc = spark.sparkContext
-    
-    # Set checkpoint directory for lineage breaking (required for checkpoint())
-    # Use a temporary directory if not already set
-    if sc.getCheckpointDir() is None:
-        sc.setCheckpointDir("dbfs:/tmp/pagerank_checkpoint")
-    
-    # Broadcast parameters
-    a = sc.broadcast(alpha)
-    N_bc = sc.broadcast(N)
-    
-    # Warm start: if initial_scores provided, use them instead of uniform initialization
-    if initial_scores is not None:
-        initial_scores_bc = sc.broadcast(initial_scores)
-        # Update graph with initial scores (keep edges_dict, update scores)
-        graph_rdd = graph_rdd.map(
-            lambda x: (x[0], (initial_scores_bc.value.get(x[0], 1.0 / N if N > 0 else 0.0), x[1][1]))
-        )
-    
-    # Helper functions (matching homework 5 logic)
-    def distribute_contributions(node):
-        """Distribute node's score to neighbors weighted by edge weights"""
-        node_id, (score, edges_dict) = node
-        if not edges_dict or len(edges_dict) == 0:
-            return []
-        # Total outlinks INCLUDING weights (e.g., if node links to X twice, count = 2)
-        total_links = sum(edges_dict.values())
-        # Safety check: avoid division by zero (shouldn't happen with valid data)
-        if total_links == 0:
-            return []
-        # Distribute proportionally by weight
-        return [(neighbor, score * weight / total_links) for neighbor, weight in edges_dict.items()]
-    
-    def update_pagerank(node_and_contrib, dangling_mass):
-        """Apply PageRank formula: PR = alpha/N + (1-alpha)*(contributions + dangling/N)"""
-        node_id, ((score, edges_dict), new_contrib) = node_and_contrib
-        received = new_contrib if new_contrib else 0.0
-        # Safety check: N should never be 0 (checked in initialization), but be defensive
-        if N_bc.value == 0:
-            return (node_id, (0.0, edges_dict))
-        new_score = a.value / N_bc.value + (1 - a.value) * (received + dangling_mass / N_bc.value)
-        return (node_id, (new_score, edges_dict))
-    
-    # Cache the initial graph to avoid recomputation
-    current_graph = graph_rdd.cache()
-    
-    for iteration in range(max_iter):
-        iter_start = datetime.now()
-        
-        # Collect dangling mass (nodes with no outlinks)
-        # Using functional approach instead of accumulators (more efficient in modern Spark)
-        dangling_nodes = current_graph.filter(lambda x: not x[1][1] or len(x[1][1]) == 0)
-        dangling_mass = dangling_nodes.map(lambda x: x[1][0]).sum()
-        dangling_mass_bc = sc.broadcast(dangling_mass)
-        
-        # Distribute contributions to neighbors
-        contribs = current_graph.flatMap(distribute_contributions)
-        
-        # Aggregate contributions by node
-        aggregated = contribs.reduceByKey(lambda a, b: a + b)
-        
-        # Update PageRank scores with formula
-        # CRITICAL: Create new graph first, then unpersist old one to avoid using unpersisted RDD
-        new_graph = current_graph.leftOuterJoin(aggregated).map(
-            lambda x: update_pagerank(x, dangling_mass_bc.value)
-        ).cache()  # Cache the new graph for next iteration
-        
-        # Check convergence: compute max change in scores
-        # CRITICAL: Check every 2 iterations after iteration 5 because each iteration doubles in cost
-        # The convergence check (join) is expensive, but checking every 2 iterations balances early detection with overhead
-        max_change = None
-        if iteration >= 5 and (iteration + 1) % 2 == 0:  # Start checking after iteration 5, every 2 iterations
-            # Compute absolute change for each node (expensive operation, but necessary to detect convergence)
-            # Extract old scores before unpersisting
-            old_scores = current_graph.map(lambda x: (x[0], x[1][0]))
-            new_scores = new_graph.map(lambda x: (x[0], x[1][0]))
-            score_changes = old_scores.join(new_scores).map(
-                lambda x: abs(x[1][0] - x[1][1])  # |old_score - new_score|
-            )
-            max_change = score_changes.max()
-        
-        # Unpersist old graph after creating new one (free memory)
-        if iteration > 0:
-            current_graph.unpersist()
-        
-        current_graph = new_graph
-        
-        # CRITICAL: Repartition every 5 iterations to break RDD lineage and prevent exponential slowdown
-        # Repartitioning forces a shuffle which breaks the lineage chain
-        # This is simpler and more reliable than checkpointing
-        # More frequent repartitioning (every 5 instead of 10) to combat exponential slowdown
-        if (iteration + 1) % 5 == 0 and iteration > 0:
-            if verbose:
-                repart_start = datetime.now()
-                print(f"  [{repart_start.strftime('%Y-%m-%d %H:%M:%S')}] Repartitioning at iteration {iteration + 1} to break lineage...")
-            # Get current partition count and repartition (forces shuffle, breaks lineage)
-            num_partitions = current_graph.getNumPartitions()
-            current_graph = current_graph.repartition(num_partitions).cache()
-            if verbose:
-                repart_end = datetime.now()
-                repart_duration = (repart_end - repart_start).total_seconds()
-                print(f"  [{repart_end.strftime('%Y-%m-%d %H:%M:%S')}] ✓ Repartition complete (took {repart_duration:.2f}s)")
-        
-        iter_end = datetime.now()
-        iter_duration = (iter_end - iter_start).total_seconds()
-        timestamp = iter_end.strftime("%Y-%m-%d %H:%M:%S")  # Use end timestamp for logging
-        
-        # Progress logging with timestamps - print every iteration for debugging
-        if verbose:
-            # Print every iteration for first 15, then every 5 iterations to track progress
-            should_print = (iteration + 1) <= 15 or (iteration + 1) % 5 == 0 or max_change is not None
-            if should_print:
-                # Only compute total_mass if we're logging (can be expensive - do less frequently)
-                if (iteration + 1) <= 15 or (iteration + 1) % 10 == 0 or max_change is not None:
-                    total_mass = current_graph.map(lambda x: x[1][0]).sum()
-                    conv_msg = f", Max change={max_change:.2e}" if max_change is not None else ""
-                    print(f"  [{timestamp}] Iteration {iteration + 1}/{max_iter}: Total mass={total_mass:.6f}, Dangling={dangling_mass:.6f}, Duration={iter_duration:.2f}s{conv_msg}")
-                else:
-                    # Just print iteration number and duration without total_mass
-                    conv_msg = f", Max change={max_change:.2e}" if max_change is not None else ""
-                    print(f"  [{timestamp}] Iteration {iteration + 1}/{max_iter}: Dangling={dangling_mass:.6f}, Duration={iter_duration:.2f}s{conv_msg}")
-        
-        # Check convergence - stop early if converged
-        if max_change is not None and max_change < tol:
-            if verbose:
-                print(f"  ✓ Converged at iteration {iteration + 1} (max change={max_change:.2e} < {tol})")
-            break
-    
-    # Extract final PageRank scores
-    pagerank_rdd = current_graph.map(lambda x: (x[0], x[1][0]))
-    
-    return pagerank_rdd
+from datetime import datetime
 
 
 # -------------------------
@@ -225,13 +26,11 @@ def _run_pagerank_rdd(graph_rdd, N, alpha=0.15, max_iter=10, verbose=True, initi
 # -------------------------
 def compute_pagerank_features(train_df, val_df, 
                               origin_col="origin", dest_col="dest",
-                              reset_probability=0.15, max_iter=10,
+                              reset_probability=0.15, max_iter=50,
                               checkpoint_dir="dbfs:/tmp/graphframes_checkpoint",
-                              verbose=True, warm_start_scores=None):
+                              verbose=True):
     """
     Compute PageRank features on training data and join to both train and val DataFrames.
-    
-    Uses fast RDD-based PageRank implementation (much faster than GraphFrames).
     
     This function is designed for precomputing graph features during fold creation.
     It computes PageRank on training data only (CV-safe) and applies to both train and val.
@@ -242,11 +41,9 @@ def compute_pagerank_features(train_df, val_df,
         origin_col: Column name for origin airport
         dest_col: Column name for destination airport
         reset_probability: PageRank reset probability (default 0.15)
-        max_iter: Maximum PageRank iterations (default 25, reasonable balance - convergence checked every 5 iterations)
-        checkpoint_dir: Spark checkpoint directory (not used with RDD implementation, kept for compatibility)
+        max_iter: Maximum PageRank iterations (default 50, higher since we only compute once)
+        checkpoint_dir: Spark checkpoint directory for GraphFrames
         verbose: Whether to print progress messages
-        warm_start_scores: Optional dict of {airport: {weighted: score, unweighted: score}} from previous fold
-                          to speed up convergence (e.g., use fold 1 scores to initialize fold 2)
     
     Returns:
         tuple: (train_df_with_features, val_df_with_features) both with graph features joined
@@ -256,88 +53,69 @@ def compute_pagerank_features(train_df, val_df,
         timestamp = start_time.strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{timestamp}] Computing graph features (train: {train_df.count():,} rows)...")
     
+    # Set checkpoint directory
     spark = SparkSession.builder.getOrCreate()
     sc = spark.sparkContext
+    sc.setCheckpointDir(checkpoint_dir)
     
     # Build graph from training data only (CV-safe)
-    # OPTIMIZATION: Use RDD reduceByKey instead of DataFrame groupBy for better performance
-    # DataFrame groupBy is slower than RDD reduceByKey for this aggregation
-    edges_rdd = (
+    edges = (
         train_df
         .select(origin_col, dest_col)
         .filter(
             col(origin_col).isNotNull() & 
             col(dest_col).isNotNull()
         )
-        .rdd
-        .map(lambda row: ((row[origin_col], row[dest_col]), 1))
-        .reduceByKey(lambda a, b: a + b)  # Count flights per route (faster than DataFrame groupBy)
-        .map(lambda x: (x[0][0], x[0][1], x[1]))  # Flatten to (src, dst, weight)
+        .groupBy(origin_col, dest_col)
+        .count()
+        .withColumnRenamed(origin_col, "src")
+        .withColumnRenamed(dest_col, "dst")
+        .withColumnRenamed("count", "weight")
     )
-    # Convert back to DataFrame
-    edges = spark.createDataFrame(edges_rdd, ["src", "dst", "weight"])
     
-    # Extract warm start scores if provided (only for weighted RDD implementation)
-    initial_weighted = None
-    if warm_start_scores is not None:
-        initial_weighted = {airport: scores.get('weighted', None) 
-                           for airport, scores in warm_start_scores.items() 
-                           if scores.get('weighted') is not None}
-        if verbose and initial_weighted:
-            print(f"  Using warm start for weighted PageRank: {len(initial_weighted)} scores")
-    
-    # Compute unweighted PageRank using GraphFrames (more refined/optimized)
-    # GraphFrames is highly optimized and doesn't need warm start
-    if verbose:
-        print("  Computing unweighted PageRank (GraphFrames)...")
-    # Set checkpoint directory for GraphFrames
-    sc.setCheckpointDir(checkpoint_dir)
-    
-    # Create vertices: all unique airports
     src_airports = edges.select(col("src").alias("id")).distinct()
     dst_airports = edges.select(col("dst").alias("id")).distinct()
     vertices = src_airports.union(dst_airports).distinct()
     
-    # Create unweighted edges (no weight column - GraphFrames treats all edges equally)
-    edges_unweighted = edges.select("src", "dst")
+    g = GraphFrame(vertices, edges)
     
-    # Create GraphFrame and run PageRank
-    g_unweighted = GraphFrame(vertices, edges_unweighted)
-    pagerank_unweighted_result = g_unweighted.pageRank(
+    # Compute unweighted PageRank
+    edges_unweighted = edges.select("src", "dst")
+    g_unweighted = GraphFrame(g.vertices, edges_unweighted)
+    pagerank_unweighted = g_unweighted.pageRank(
         resetProbability=reset_probability,
         maxIter=max_iter
     )
     
-    # Extract PageRank scores
-    pagerank_unweighted_df = pagerank_unweighted_result.vertices.select(
-        col("id").alias("airport"),
-        col("pagerank").alias("pagerank_unweighted")
+    # Compute weighted PageRank (using duplication workaround)
+    edges_weighted = (
+        edges
+        .withColumn("seq", F.sequence(F.lit(0), col("weight").cast("int") - 1))
+        .select("src", "dst", F.explode("seq").alias("_"))
+        .select("src", "dst")
     )
-    
-    # Compute weighted PageRank using RDD implementation (supports native weights, no duplication needed)
-    if verbose:
-        print("  Computing weighted PageRank (RDD)...")
-    graph_weighted, N_w = _init_graph_rdd(edges)
-    pagerank_weighted_rdd = _run_pagerank_rdd(
-        graph_weighted, N_w, alpha=reset_probability, max_iter=max_iter, 
-        verbose=verbose, initial_scores=initial_weighted
-    )
-    
-    # Convert weighted RDD to DataFrame
-    pagerank_weighted_df = spark.createDataFrame(
-        pagerank_weighted_rdd.map(lambda x: (x[0], float(x[1]))),
-        ["airport", "pagerank_weighted"]
+    g_weighted = GraphFrame(g.vertices, edges_weighted)
+    pagerank_weighted = g_weighted.pageRank(
+        resetProbability=reset_probability,
+        maxIter=max_iter
     )
     
     # Combine PageRank scores
-    pagerank_scores = pagerank_unweighted_df.join(pagerank_weighted_df, "airport", "outer")
+    pr_unw = pagerank_unweighted.vertices.select(
+        col("id").alias("airport"),
+        col("pagerank").alias("pagerank_unweighted")
+    )
+    pr_w = pagerank_weighted.vertices.select(
+        col("id").alias("airport"),
+        col("pagerank").alias("pagerank_weighted")
+    )
+    pagerank_scores = pr_unw.join(pr_w, "airport", "outer")
     
-    # Broadcast for efficient joins (small lookup table ~200 airports)
+    # Broadcast for efficient joins
     broadcast_scores = broadcast(pagerank_scores)
     
-    # Join origin and dest first, then cache to break lineage before prev_flight joins
-    # This prevents Spark from having to recompute the origin/dest joins when adding prev_flight features
-    train_with_base = (
+    # Join to train_df
+    train_with_features = (
         train_df
         .join(broadcast_scores, col(origin_col) == col("airport"), "left")
         .withColumnRenamed("pagerank_weighted", "origin_pagerank_weighted")
@@ -347,10 +125,10 @@ def compute_pagerank_features(train_df, val_df,
         .withColumnRenamed("pagerank_weighted", "dest_pagerank_weighted")
         .withColumnRenamed("pagerank_unweighted", "dest_pagerank_unweighted")
         .drop("airport")
-        .cache()  # Cache after base joins to break lineage
     )
     
-    val_with_base = (
+    # Join to val_df
+    val_with_features = (
         val_df
         .join(broadcast_scores, col(origin_col) == col("airport"), "left")
         .withColumnRenamed("pagerank_weighted", "origin_pagerank_weighted")
@@ -360,34 +138,26 @@ def compute_pagerank_features(train_df, val_df,
         .withColumnRenamed("pagerank_weighted", "dest_pagerank_weighted")
         .withColumnRenamed("pagerank_unweighted", "dest_pagerank_unweighted")
         .drop("airport")
-        .cache()  # Cache after base joins to break lineage
     )
     
-    # Trigger cache materialization (lightweight - just count)
-    _ = train_with_base.count()
-    _ = val_with_base.count()
-    
     # Add prev_flight graph features if prev_flight columns exist
-    train_with_features = train_with_base
-    val_with_features = val_with_base
-    
-    if "prev_flight_origin" in train_with_base.columns:
+    if "prev_flight_origin" in train_with_features.columns:
         train_with_features = (
-            train_with_base
+            train_with_features
             .join(broadcast_scores, col("prev_flight_origin") == col("airport"), "left")
             .withColumnRenamed("pagerank_weighted", "prev_flight_origin_pagerank_weighted")
             .withColumnRenamed("pagerank_unweighted", "prev_flight_origin_pagerank_unweighted")
             .drop("airport")
         )
         val_with_features = (
-            val_with_base
+            val_with_features
             .join(broadcast_scores, col("prev_flight_origin") == col("airport"), "left")
             .withColumnRenamed("pagerank_weighted", "prev_flight_origin_pagerank_weighted")
             .withColumnRenamed("pagerank_unweighted", "prev_flight_origin_pagerank_unweighted")
             .drop("airport")
         )
     
-    if "prev_flight_dest" in train_with_base.columns:
+    if "prev_flight_dest" in train_with_features.columns:
         train_with_features = (
             train_with_features
             .join(broadcast_scores, col("prev_flight_dest") == col("airport"), "left")
@@ -421,24 +191,17 @@ def compute_pagerank_features(train_df, val_df,
     train_with_features = train_with_features.fillna(fill_dict)
     val_with_features = val_with_features.fillna(fill_dict)
     
-    # CRITICAL: Cache the final DataFrames to avoid recomputing joins on every action
-    # This is especially important since these DataFrames will be used multiple times
-    # (for meta-model training, pipeline fitting, etc.)
-    train_with_features = train_with_features.cache()
-    val_with_features = val_with_features.cache()
-    
     # Safety check: Validate that graph features were successfully joined
-    # Trigger caching by counting (lightweight action) - reuse counts for validation
     if verbose:
-        # Check for missing airports (filled with 0.0) and trigger cache
-        train_total = train_with_features.count()
-        val_total = val_with_features.count()
+        # Check for missing airports (filled with 0.0)
         train_missing = train_with_features.filter(
             col("origin_pagerank_weighted") == 0.0
         ).count()
         val_missing = val_with_features.filter(
             col("origin_pagerank_weighted") == 0.0
         ).count()
+        train_total = train_with_features.count()
+        val_total = val_with_features.count()
         
         if train_missing > 0 or val_missing > 0:
             print(f"  ⚠ Warning: {train_missing:,}/{train_total:,} train rows and {val_missing:,}/{val_total:,} val rows have missing airports (filled with 0.0)")
@@ -450,19 +213,7 @@ def compute_pagerank_features(train_df, val_df,
         timestamp = end_time.strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{timestamp}] ✓ Graph features computed! (took {duration})")
     
-    # Extract PageRank scores for warm start (convert to dict for easy reuse)
-    # Note: Only weighted scores are used for warm start (RDD implementation)
-    # Unweighted uses GraphFrames which doesn't support warm start
-    # Convert to dict format: {airport: {weighted: score, unweighted: score}}
-    pagerank_scores_dict = {}
-    scores_rows = pagerank_scores.select("airport", "pagerank_weighted", "pagerank_unweighted").collect()
-    for row in scores_rows:
-        pagerank_scores_dict[row.airport] = {
-            'weighted': row.pagerank_weighted,
-            'unweighted': row.pagerank_unweighted  # Included for completeness, but not used for warm start
-        }
-    
-    return train_with_features, val_with_features, pagerank_scores_dict
+    return train_with_features, val_with_features
 
 
 class GraphFeaturesModel(Model):
@@ -555,8 +306,8 @@ class GraphFeaturesModel(Model):
                 )
                 .withColumnRenamed("pagerank_weighted", "prev_flight_dest_pagerank_weighted")
                 .withColumnRenamed("pagerank_unweighted", "prev_flight_dest_pagerank_unweighted")
-            .drop("airport")
-        )
+                .drop("airport")
+            )
         
         # Fill NULL PageRank values with 0 (for airports not in training graph)
         # TODO: Consider better imputation strategy. Isolated nodes in PageRank still receive
@@ -616,7 +367,7 @@ class GraphFeaturesEstimator(Estimator):
                  origin_col="origin",
                  dest_col="dest",
                  reset_probability=0.15,
-                 max_iter=10,
+                 max_iter=50,
                  checkpoint_dir="dbfs:/tmp/graphframes_checkpoint"):
         super(GraphFeaturesEstimator, self).__init__()
         self.origin_col = origin_col
@@ -626,26 +377,40 @@ class GraphFeaturesEstimator(Estimator):
         self.checkpoint_dir = checkpoint_dir
         self._spark = SparkSession.builder.getOrCreate()
         
-    def _build_edges(self, df):
-        """Build edges DataFrame from flight data: nodes=airports, edges=flights"""
-        # OPTIMIZATION: Use RDD reduceByKey instead of DataFrame groupBy for better performance
-        # DataFrame groupBy is slower than RDD reduceByKey for this aggregation
-        sc = self._spark.sparkContext
-        edges_rdd = (
+    def _build_graph(self, df):
+        """Build graph from flight data: nodes=airports, edges=flights"""
+        # Create edges: (origin, dest) with count as weight
+        edges = (
             df
             .select(self.origin_col, self.dest_col)
             .filter(
                 col(self.origin_col).isNotNull() & 
                 col(self.dest_col).isNotNull()
             )
-            .rdd
-            .map(lambda row: ((row[self.origin_col], row[self.dest_col]), 1))
-            .reduceByKey(lambda a, b: a + b)  # Count flights per route (faster than DataFrame groupBy)
-            .map(lambda x: (x[0][0], x[0][1], x[1]))  # Flatten to (src, dst, weight)
+            .groupBy(self.origin_col, self.dest_col)
+            .count()
+            .withColumnRenamed(self.origin_col, "src")
+            .withColumnRenamed(self.dest_col, "dst")
+            .withColumnRenamed("count", "weight")
         )
-        # Convert back to DataFrame
-        edges = self._spark.createDataFrame(edges_rdd, ["src", "dst", "weight"])
-        return edges
+        
+        # Create vertices: all unique airports
+        src_airports = edges.select(col("src").alias("id")).distinct()
+        dst_airports = edges.select(col("dst").alias("id")).distinct()
+        vertices = src_airports.union(dst_airports).distinct()
+        
+        return GraphFrame(vertices, edges), edges
+    
+    def _create_weighted_edges(self, edges):
+        """Create weighted graph using duplication workaround"""
+        # Duplicate edges based on weight using sequence and explode
+        edges_weighted = (
+            edges
+            .withColumn("seq", F.sequence(F.lit(0), col("weight").cast("int") - 1))
+            .select("src", "dst", F.explode("seq").alias("_"))
+            .select("src", "dst")
+        )
+        return edges_weighted
     
     def _fit(self, df):
         """
@@ -674,51 +439,46 @@ class GraphFeaturesEstimator(Estimator):
                 dest_col=self.dest_col
             )
         
-        # Graph features don't exist - compute them using fast RDD implementation
+        # Graph features don't exist - compute them
         start_time = datetime.now()
         timestamp = start_time.strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{timestamp}] Generating graph features...")
         
+        # Set checkpoint directory
         sc = self._spark.sparkContext
+        sc.setCheckpointDir(self.checkpoint_dir)
         
-        # Set checkpoint directory for GraphFrames
-        if sc.getCheckpointDir() is None:
-            sc.setCheckpointDir(self.checkpoint_dir)
-        else:
-            sc.setCheckpointDir(self.checkpoint_dir)
+        # Build graph
+        g, edges = self._build_graph(df)
         
-        # Build edges DataFrame
-        edges = self._build_edges(df)
-        
-        # Compute unweighted PageRank using GraphFrames (matches precomputation for consistency)
-        # GraphFrames is highly optimized for unweighted PageRank
-        src_airports = edges.select(col("src").alias("id")).distinct()
-        dst_airports = edges.select(col("dst").alias("id")).distinct()
-        vertices = src_airports.union(dst_airports).distinct()
+        # Compute unweighted PageRank (edges without weight column)
         edges_unweighted = edges.select("src", "dst")
-        g_unweighted = GraphFrame(vertices, edges_unweighted)
-        pagerank_unweighted_result = g_unweighted.pageRank(
+        g_unweighted = GraphFrame(g.vertices, edges_unweighted)
+        pagerank_unweighted = g_unweighted.pageRank(
             resetProbability=self.reset_probability,
             maxIter=self.max_iter
         )
-        pagerank_unweighted_df = pagerank_unweighted_result.vertices.select(
+        
+        # Compute weighted PageRank (using duplication workaround)
+        edges_weighted = self._create_weighted_edges(edges)
+        g_weighted = GraphFrame(g.vertices, edges_weighted)
+        pagerank_weighted = g_weighted.pageRank(
+            resetProbability=self.reset_probability,
+            maxIter=self.max_iter
+        )
+        
+        # Combine PageRank scores into single DataFrame
+        pr_unw = pagerank_unweighted.vertices.select(
             col("id").alias("airport"),
             col("pagerank").alias("pagerank_unweighted")
         )
         
-        # Compute weighted PageRank using RDD implementation (supports native weights)
-        graph_weighted, N_w = _init_graph_rdd(edges)
-        pagerank_weighted_rdd = _run_pagerank_rdd(
-            graph_weighted, N_w, alpha=self.reset_probability,
-            max_iter=self.max_iter, verbose=False
-        )
-        pagerank_weighted_df = self._spark.createDataFrame(
-            pagerank_weighted_rdd.map(lambda x: (x[0], float(x[1]))),
-            ["airport", "pagerank_weighted"]
+        pr_w = pagerank_weighted.vertices.select(
+            col("id").alias("airport"),
+            col("pagerank").alias("pagerank_weighted")
         )
         
-        # Combine PageRank scores into single DataFrame
-        pagerank_scores = pagerank_unweighted_df.join(pagerank_weighted_df, "airport", "outer")
+        pagerank_scores = pr_unw.join(pr_w, "airport", "outer")
 
         # Cache the PageRank scores since they'll be used multiple times in transform (origin + dest joins)
         pagerank_scores = pagerank_scores.cache()

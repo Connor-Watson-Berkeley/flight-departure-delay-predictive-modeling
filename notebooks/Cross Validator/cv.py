@@ -42,8 +42,16 @@ TOTAL_FOLDS = 4
 # DATA LOADER (CUSTOM ONLY)
 # -----------------------------
 class FlightDelayDataLoader:
-    def __init__(self):
+    def __init__(self, suffix: str = ""):
+        """
+        Initialize the data loader.
+        
+        Args:
+            suffix: Optional suffix to append to version (e.g., "_with_graph", "_with_graph_and_metamodels")
+                    Default: "" (base folds with only flight lineage features)
+        """
         self.folds = {}
+        self.suffix = suffix
         self.numerical_features = [
             'hourlyprecipitation',
             'hourlysealevelpressure',
@@ -80,6 +88,9 @@ class FlightDelayDataLoader:
             'lineage_actual_turn_time_minutes',
             # Safe features (intelligent data leakage handling)
             'safe_lineage_rotation_time_minutes',
+            'safe_prev_departure_delay',
+            'safe_prev_arrival_delay',
+            'safe_time_since_prev_arrival',
             # Other lineage features
             'lineage_expected_flight_time_minutes',
             'lineage_cumulative_delay',
@@ -89,7 +100,6 @@ class FlightDelayDataLoader:
             # Required time features
             'required_time_prev_flight_minutes',
             'safe_required_time_prev_flight_minutes',
-            'impossible_on_time_flag',
             'safe_impossible_on_time_flag',
         ]
 
@@ -124,23 +134,34 @@ class FlightDelayDataLoader:
     def _load_version(self, version):
         folds = []
         for fold_idx in range(1, TOTAL_FOLDS + 1):
-            train_name = f"OTPW_{SOURCE}_{version}_FOLD_{fold_idx}_TRAIN"
+            # Include suffix in filename if provided
+            train_name = f"OTPW_{SOURCE}_{version}{self.suffix}_FOLD_{fold_idx}_TRAIN"
             train_df = self._load_parquet(train_name)
 
             if fold_idx < TOTAL_FOLDS:
-                val_name = f"OTPW_{SOURCE}_{version}_FOLD_{fold_idx}_VAL"
+                val_name = f"OTPW_{SOURCE}_{version}{self.suffix}_FOLD_{fold_idx}_VAL"
                 val_df = self._load_parquet(val_name)
                 folds.append((train_df, val_df))
             else:
-                test_name = f"OTPW_{SOURCE}_{version}_FOLD_{fold_idx}_TEST"
+                test_name = f"OTPW_{SOURCE}_{version}{self.suffix}_FOLD_{fold_idx}_TEST"
                 test_df = self._load_parquet(test_name)
                 folds.append((train_df, test_df))
 
         return folds
 
     def load(self):
+        """Load all available versions, skipping any that don't exist."""
         for v in VERSIONS:
-            self.folds[v] = self._load_version(v)
+            try:
+                self.folds[v] = self._load_version(v)
+            except Exception as e:
+                # Skip versions that don't exist or can't be loaded
+                error_msg = str(e)
+                if "PATH_NOT_FOUND" in error_msg or "does not exist" in error_msg:
+                    print(f"⚠ Skipping version '{v}' - files not found (suffix: '{self.suffix}')")
+                else:
+                    # Re-raise if it's a different error (permissions, etc.)
+                    raise
 
     def get_version(self, version):
         return self.folds[version]
@@ -317,6 +338,26 @@ class FlightDelayCV:
             results.append({**{f"{k}_train": v for k, v in train_metric.items()}, 
                           **{f"{k}_val": v for k, v in val_metric.items()},
                           'fold': f'Fold {i}'})
+            
+            # ADDED_BY_SID_START
+            # CRITICAL: Clean up after EVERY fold
+            print(f"Cleaning up fold {i}...")
+            spark.catalog.clearCache()
+            
+            try:
+                train_df.unpersist()
+                val_df.unpersist()
+                if 'val_preds' in locals():
+                    val_preds.unpersist()
+            except:
+                pass
+            
+            import gc
+            gc.collect()
+            print(f"✓ Fold {i} cleaned up\n")
+            # ADDED_BY_SID_END
+            
+
 
         # Create DataFrame with alternating Train/Val rows
         formatted_results = []
