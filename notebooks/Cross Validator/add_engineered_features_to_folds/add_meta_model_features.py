@@ -19,6 +19,8 @@ from pyspark.ml import Pipeline
 from datetime import datetime
 import importlib.util
 import sys
+import time
+import logging
 
 # XGBoost support (much faster than Random Forest - 5-10x speedup)
 from xgboost.spark import SparkXGBRegressor
@@ -27,7 +29,7 @@ from xgboost.spark import SparkXGBRegressor
 # CONFIGURATION
 # -------------------------
 # List of versions to process (e.g., ["3M", "12M", "60M", "XM"])
-VERSIONS = ["60M","3M","12M"]  # <-- EDIT THIS LIST
+VERSIONS = ["3M","60M","12M"]  # <-- EDIT THIS LIST
 
 INPUT_FOLDER = "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed"
 OUTPUT_FOLDER = "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed"
@@ -36,7 +38,25 @@ WRITE_MODE = "overwrite"
 VERBOSE = True
 OUTPUT_SUFFIX = "_with_graph_and_metamodels"
 INPUT_SUFFIX = "_with_graph"  # Input suffix: '_with_graph' (base) or '_with_graph_and_metamodels' (to add more models)
-SKIP_EXISTING_FOLDS = False  # If True, skip folds that already exist in output (resume mode)
+SKIP_EXISTING_FOLDS = True  # If True, skip folds where all 3 meta-model predictions already exist. 
+                             # If any are missing, the fold will be re-processed to add the missing models.
+
+# Retry configuration for robust handling of cluster failures
+MAX_RETRIES = 10  # Maximum number of retry attempts
+INITIAL_RETRY_DELAY = 60  # Initial delay in seconds (exponential backoff)
+RETRYABLE_ERRORS = [
+    "ExecutorLostFailure",
+    "worker lost",
+    "heartbeat timeout",
+    "barrier ResultStage",
+    "Stage failed",
+    "Could not recover",
+    "BarrierJobSlotsNumberCheckFailed",  # XGBoost requesting more workers than available
+    "does not allow run a barrier stage that requires more slots",
+    "SPARK_JOB_CANCELLED",  # Job cancelled (often due to timeout or resource constraints - retryable)
+    "Job.*cancelled",  # Pattern match for job cancellation
+    "cancelled as part of cancellation"  # Job cancellation message
+]
 
 # NOTE: To add a new meta-model version (e.g., XGB_2) without losing existing ones:
 #   1. Set INPUT_SUFFIX = "_with_graph_and_metamodels" (reads existing meta-model predictions)
@@ -95,14 +115,32 @@ def load_folds_for_version(version: str, input_suffix: str = ""):
     Load all available folds for a version using cv.py's FlightDelayDataLoader.
     Returns list of (train_df, val_or_test_df, fold_type) tuples, where fold_type is either
     "VAL" (for CV folds) or "TEST" (for test fold).
+    
+    Note: Handles schema mismatches by using mergeSchema option when reading parquet.
     """
     cv = load_cv_module()
     
     # Create data loader with suffix
     data_loader = cv.FlightDelayDataLoader(suffix=input_suffix)
     
-    # Load folds for this specific version (uses suffix automatically)
-    folds_raw = data_loader._load_version(version)
+    # Temporarily patch _load_parquet to use mergeSchema for schema evolution
+    original_load_parquet = data_loader._load_parquet
+    def _load_parquet_with_merge_schema(name):
+        spark = SparkSession.builder.getOrCreate()
+        # Use mergeSchema to handle type mismatches (e.g., INT64 vs double)
+        df = spark.read.option("mergeSchema", "true").parquet(f"{cv.FOLDER_PATH}/{name}.parquet")
+        df = data_loader._cast_numerics(df)
+        return df
+    
+    # Patch the method
+    data_loader._load_parquet = _load_parquet_with_merge_schema
+    
+    try:
+        # Load folds for this specific version (uses suffix automatically)
+        folds_raw = data_loader._load_version(version)
+    finally:
+        # Restore original method
+        data_loader._load_parquet = original_load_parquet
     
     # Convert to our format: (train_df, val_or_test_df, fold_type)
     folds = []
@@ -128,8 +166,21 @@ def load_folds_for_version(version: str, input_suffix: str = ""):
     return folds
 
 
-def fold_exists(version: str, fold_idx: int, output_suffix: str, fold_type: str):
-    """Check if a fold already exists in the output folder."""
+def fold_exists(version: str, fold_idx: int, output_suffix: str, fold_type: str,
+                expected_model_ids: list = None):
+    """
+    Check if a fold already exists in the output folder AND has all expected meta-model predictions.
+    
+    Args:
+        version: Data version (e.g., "12M")
+        fold_idx: Fold index (1-4)
+        output_suffix: Output suffix (e.g., "_with_graph_and_metamodels")
+        fold_type: "VAL" or "TEST"
+        expected_model_ids: List of model IDs that should have predictions (e.g., ["XGB_1"])
+    
+    Returns:
+        True if fold exists AND has all expected prediction columns, False otherwise
+    """
     from pyspark.sql import SparkSession
     spark = SparkSession.builder.getOrCreate()
     
@@ -153,12 +204,46 @@ def fold_exists(version: str, fold_idx: int, output_suffix: str, fold_type: str)
         )
         train_exists = fs.exists(spark.sparkContext._jvm.org.apache.hadoop.fs.Path(train_path))
         val_exists = fs.exists(spark.sparkContext._jvm.org.apache.hadoop.fs.Path(val_path))
-        return train_exists and val_exists
+        
+        if not (train_exists and val_exists):
+            return False
+        
+        # If expected_model_ids provided, check for all expected prediction columns
+        if expected_model_ids:
+            try:
+                # Read schema to check columns (fast, doesn't load data)
+                # Use mergeSchema=True to handle schema evolution, and allow type mismatches
+                train_df = spark.read.option("mergeSchema", "true").parquet(train_path)
+                train_cols = set(train_df.columns)
+                
+                # Expected prediction columns for each model ID
+                expected_cols = []
+                for model_id in expected_model_ids:
+                    expected_cols.extend([
+                        f"predicted_prev_flight_air_time_{model_id}",
+                        f"predicted_prev_flight_turnover_time_{model_id}",  # Note: This is turnover time, not raw taxi time
+                        f"predicted_prev_flight_total_duration_{model_id}"
+                    ])
+                
+                # Check if all expected columns exist
+                missing_cols = [col for col in expected_cols if col not in train_cols]
+                
+                if missing_cols:
+                    # Fold exists but is incomplete - return False so it gets reprocessed
+                    return False
+                
+                return True
+            except Exception:
+                # If we can't read the schema, assume incomplete
+                return False
+        
+        return True
     except Exception as e:
         # Fallback: try to read schema (slower but more reliable)
         try:
-            train_df = spark.read.parquet(train_path)
-            val_df = spark.read.parquet(val_path)
+            # Use mergeSchema=True to handle schema evolution
+            train_df = spark.read.option("mergeSchema", "true").parquet(train_path)
+            val_df = spark.read.option("mergeSchema", "true").parquet(val_path)
             _ = train_df.schema
             _ = val_df.schema
             return True
@@ -212,6 +297,26 @@ def compute_meta_model_predictions(train_df, val_df, model_id="RF_1", verbose=Tr
     train_with_meta = train_df
     val_with_meta = val_df
     
+    # Check which prediction columns already exist (for incremental training)
+    expected_pred_cols = {
+        "prev_flight_air_time": f"predicted_prev_flight_air_time_{model_id}",
+        "prev_flight_taxi_time": f"predicted_prev_flight_turnover_time_{model_id}",
+        "prev_flight_total_duration": f"predicted_prev_flight_total_duration_{model_id}"
+    }
+    
+    existing_pred_cols = {}
+    for target, pred_col in expected_pred_cols.items():
+        if pred_col in train_with_meta.columns and pred_col in val_with_meta.columns:
+            existing_pred_cols[target] = pred_col
+    
+    if verbose and existing_pred_cols:
+        print(f"\n  🔍 Found {len(existing_pred_cols)}/{len(expected_pred_cols)} existing prediction columns:")
+        for target, pred_col in existing_pred_cols.items():
+            print(f"    ✓ {pred_col} (will skip training)")
+        missing = [target for target in expected_pred_cols.keys() if target not in existing_pred_cols]
+        if missing:
+            print(f"  Will train models for: {', '.join(missing)}")
+    
     # Add special case flags
     if "is_first_flight" not in train_with_meta.columns:
         train_with_meta = train_with_meta.withColumn("is_first_flight", (col("lineage_rank") == 1).cast("int"))
@@ -221,7 +326,61 @@ def compute_meta_model_predictions(train_df, val_df, model_id="RF_1", verbose=Tr
         val_with_meta = val_with_meta.withColumn("is_jump", col("lineage_is_jump").cast("int"))
     
     # Compute derived target columns if needed
-    if "prev_flight_taxi_time" not in train_with_meta.columns:
+    # Note: These are derived from available columns if the target columns don't exist
+    # This allows the script to work with datasets that may not have all flight lineage features
+    
+    # Derive prev_flight_air_time from prev_flight_crs_elapsed_time if needed
+    if "prev_flight_air_time" not in train_with_meta.columns:
+        if "prev_flight_crs_elapsed_time" in train_with_meta.columns:
+            train_with_meta = train_with_meta.withColumn(
+                "prev_flight_air_time", col("prev_flight_crs_elapsed_time")
+            )
+            val_with_meta = val_with_meta.withColumn(
+                "prev_flight_air_time", col("prev_flight_crs_elapsed_time")
+            )
+            if verbose:
+                print(f"  ✓ Derived prev_flight_air_time from prev_flight_crs_elapsed_time")
+    else:
+        if verbose:
+            print(f"  🔍✓ Using existing prev_flight_air_time column")
+    
+    # Derive prev_flight_taxi_time from turnover time (current departure - previous arrival)
+    # This is the ground time between previous flight arrival and current flight departure
+    # ALWAYS use turnover time, not raw taxi_in + taxi_out
+    # Priority: existing prev_flight_taxi_time > lineage_actual_turnover_time_minutes > scheduled_lineage_turnover_time_minutes > taxi_in + taxi_out
+    if "prev_flight_taxi_time" in train_with_meta.columns:
+        # Use existing prev_flight_taxi_time if it already exists (preferred - already computed)
+        if verbose:
+            print(f"  🔍✓ Using existing prev_flight_taxi_time column")
+    elif "lineage_actual_turnover_time_minutes" in train_with_meta.columns:
+        # Use actual turnover time (fallback - uses actual times)
+        train_with_meta = train_with_meta.withColumn(
+            "prev_flight_taxi_time",
+            col("lineage_actual_turnover_time_minutes")
+        )
+        val_with_meta = val_with_meta.withColumn(
+            "prev_flight_taxi_time",
+            col("lineage_actual_turnover_time_minutes")
+        )
+        if verbose:
+            # Verify the column was actually created
+            has_col = "prev_flight_taxi_time" in train_with_meta.columns
+            print(f"  ✓ Derived prev_flight_taxi_time from lineage_actual_turnover_time_minutes (verified: {has_col})")
+    elif "scheduled_lineage_turnover_time_minutes" in train_with_meta.columns:
+        # Use scheduled turnover time (fallback - uses scheduled times)
+        train_with_meta = train_with_meta.withColumn(
+            "prev_flight_taxi_time",
+            col("scheduled_lineage_turnover_time_minutes")
+        )
+        val_with_meta = val_with_meta.withColumn(
+            "prev_flight_taxi_time",
+            col("scheduled_lineage_turnover_time_minutes")
+        )
+        if verbose:
+            print(f"  ✓ Derived prev_flight_taxi_time from scheduled_lineage_turnover_time_minutes")
+    else:
+        # Last resort: use raw taxi_in + taxi_out (not ideal, but better than nothing)
+        # This should rarely happen if flight lineage features are properly applied
         if "prev_flight_taxi_in" in train_with_meta.columns or "prev_flight_taxi_out" in train_with_meta.columns:
             train_with_meta = train_with_meta.withColumn(
                 "prev_flight_taxi_time",
@@ -233,7 +392,10 @@ def compute_meta_model_predictions(train_df, val_df, model_id="RF_1", verbose=Tr
                 coalesce(col("prev_flight_taxi_in"), lit(0.0)) + 
                 coalesce(col("prev_flight_taxi_out"), lit(0.0))
             )
+            if verbose:
+                print(f"  ⚠ Derived prev_flight_taxi_time from prev_flight_taxi_in + prev_flight_taxi_out (fallback)")
     
+    # Derive prev_flight_total_duration from prev_flight_actual_elapsed_time if needed
     if "prev_flight_total_duration" not in train_with_meta.columns:
         if "prev_flight_actual_elapsed_time" in train_with_meta.columns:
             train_with_meta = train_with_meta.withColumn(
@@ -242,6 +404,11 @@ def compute_meta_model_predictions(train_df, val_df, model_id="RF_1", verbose=Tr
             val_with_meta = val_with_meta.withColumn(
                 "prev_flight_total_duration", col("prev_flight_actual_elapsed_time")
             )
+            if verbose:
+                print(f"  ✓ Derived prev_flight_total_duration from prev_flight_actual_elapsed_time")
+    else:
+        if verbose:
+            print(f"  🔍✓ Using existing prev_flight_total_duration column")
     
     # Get shared feature lists (all models use the same features)
     categorical_features, numerical_features = _get_shared_features(train_with_meta)
@@ -253,12 +420,42 @@ def compute_meta_model_predictions(train_df, val_df, model_id="RF_1", verbose=Tr
     # Build shared preprocessing pipeline (fit once, use for all models)
     preprocessing_pipeline = _build_shared_preprocessing_pipeline(categorical_features, numerical_features)
     
-    # Fit preprocessing on training data (includes all rows, not filtered by target)
-    fitted_preprocessing = preprocessing_pipeline.fit(train_with_meta)
+    # Fit preprocessing on training data (with retry for cluster failures)
+    if verbose:
+        print("  Fitting preprocessing pipeline (this may take a moment on large datasets)...")
     
-    # Apply preprocessing to both train and val once
-    train_preprocessed = fitted_preprocessing.transform(train_with_meta)
-    val_preprocessed = fitted_preprocessing.transform(val_with_meta)
+    def _fit_preprocessing():
+        return preprocessing_pipeline.fit(train_with_meta)
+    
+    fitted_preprocessing = _retry_with_backoff(_fit_preprocessing, verbose=verbose)
+    
+    # Apply preprocessing to both train and val once (with retry)
+    if verbose:
+        print("  Applying preprocessing to train and validation sets...")
+    
+    def _transform_train():
+        return fitted_preprocessing.transform(train_with_meta)
+    
+    def _transform_val():
+        return fitted_preprocessing.transform(val_with_meta)
+    
+    train_preprocessed = _retry_with_backoff(_transform_train, verbose=verbose)
+    val_preprocessed = _retry_with_backoff(_transform_val, verbose=verbose)
+    
+    # IMPORTANT: Verify target columns are preserved through preprocessing
+    # Spark ML transformers should preserve all columns not in their inputCols, but let's verify
+    target_columns = ["prev_flight_air_time", "prev_flight_taxi_time", "prev_flight_total_duration"]
+    missing_in_preprocessed = []
+    for target in target_columns:
+        if target in train_with_meta.columns and target not in train_preprocessed.columns:
+            missing_in_preprocessed.append(target)
+    
+    if missing_in_preprocessed:
+        raise RuntimeError(
+            f"CRITICAL: Target columns were dropped during preprocessing: {missing_in_preprocessed}. "
+            f"This should never happen - Spark ML transformers preserve all columns not in inputCols. "
+            f"Please check the preprocessing pipeline."
+        )
     
     # Cache preprocessed DataFrames to avoid recomputation during model training
     if verbose:
@@ -271,43 +468,153 @@ def compute_meta_model_predictions(train_df, val_df, model_id="RF_1", verbose=Tr
         val_count = val_preprocessed.count()
         print(f"  ✓ Preprocessing complete (applied to {train_count:,} train, {val_count:,} val rows)")
         print("  ✓ Preprocessed DataFrames cached")
+        print("  ✓ Verified: All target columns preserved through preprocessing")
+        
+        # Debug: Check which target columns are available
+        print(f"\n  🔍 Checking target columns in preprocessed DataFrames:")
+        for target in target_columns:
+            in_original = target in train_with_meta.columns
+            in_preprocessed = target in train_preprocessed.columns
+            status = "✓" if (in_original and in_preprocessed) else "✗"
+            print(f"    {status} {target}: original={in_original}, preprocessed={in_preprocessed}")
+            
+            # If missing, show why
+            if not in_original:
+                if target == "prev_flight_taxi_time":
+                    has_turnover = "lineage_actual_turnover_time_minutes" in train_with_meta.columns
+                    print(f"      ⚠ Missing in original - lineage_actual_turnover_time_minutes exists: {has_turnover}")
+                    if has_turnover:
+                        print(f"      ⚠ BUG: Derivation should have created prev_flight_taxi_time but didn't!")
+                elif target == "prev_flight_air_time":
+                    has_crs = "prev_flight_crs_elapsed_time" in train_with_meta.columns
+                    print(f"      ⚠ Missing in original - prev_flight_crs_elapsed_time exists: {has_crs}")
+                    if has_crs:
+                        print(f"      ⚠ BUG: Derivation should have created prev_flight_air_time but didn't!")
+                elif target == "prev_flight_total_duration":
+                    has_actual = "prev_flight_actual_elapsed_time" in train_with_meta.columns
+                    print(f"      ⚠ Missing in original - prev_flight_actual_elapsed_time exists: {has_actual}")
+                    if has_actual:
+                        print(f"      ⚠ BUG: Derivation should have created prev_flight_total_duration but didn't!")
+            elif in_original and not in_preprocessed:
+                print(f"      ⚠ CRITICAL ERROR: Column exists in original but missing after preprocessing!")
+                print(f"      ⚠ This indicates a bug in the preprocessing pipeline!")
     
-    # Train and apply air_time model
-    if "prev_flight_air_time" in train_with_meta.columns:
-        train_with_meta, val_with_meta = _train_and_apply_model_with_preprocessed(
-            train_preprocessed, val_preprocessed,
-            "prev_flight_air_time", "predicted_prev_flight_air_time",
-            model_config, verbose
-        )
+    # Helper function to check if target column is valid for training
+    def _check_target_column(df, target_col, col_name):
+        """Check if target column exists and has non-null values."""
+        if target_col not in df.columns:
+            if verbose:
+                print(f"  ⚠ Skipping {col_name} model (column '{target_col}' not found)")
+            return False
+        
+        # Check if column has non-null values
+        non_null_count = df.filter(col(target_col).isNotNull()).count()
+        total_count = df.count()
+        
+        if non_null_count == 0:
+            if verbose:
+                print(f"  ⚠ Skipping {col_name} model (column '{target_col}' has no non-null values)")
+            return False
+        
+        if verbose:
+            print(f"  ✓ {col_name} model: {non_null_count:,}/{total_count:,} rows have non-null target")
+        
+        return True
     
-    # Train and apply taxi_time model
-    if "prev_flight_taxi_time" in train_with_meta.columns:
-        train_with_meta, val_with_meta = _train_and_apply_model_with_preprocessed(
-            train_preprocessed, val_preprocessed,
-            "prev_flight_taxi_time", "predicted_prev_flight_taxi_time",
-            model_config, verbose
-        )
+    # Train and apply models in order: total_duration, taxi_time, air_time (air_time last to avoid positional issues)
+    # CRITICAL: Pass train_with_meta/val_with_meta to preserve predictions from previous models
+    # Train and apply total_duration model (only if prediction doesn't already exist)
+    if "prev_flight_total_duration" not in existing_pred_cols:
+        if _check_target_column(train_preprocessed, "prev_flight_total_duration", "prev_flight_total_duration"):
+            train_with_meta, val_with_meta = _train_and_apply_model_with_preprocessed(
+                train_preprocessed, val_preprocessed,
+                "prev_flight_total_duration", "predicted_prev_flight_total_duration",
+                model_config, verbose,
+                train_with_meta=train_with_meta, val_with_meta=val_with_meta
+            )
+        else:
+            if verbose:
+                print(f"  ⏭ Skipping prev_flight_total_duration model (target column invalid)")
+    else:
+        if verbose:
+            print(f"  ⏭ Skipping prev_flight_total_duration model (prediction already exists: {existing_pred_cols['prev_flight_total_duration']})")
     
-    # Train and apply total_duration model
-    if "prev_flight_total_duration" in train_with_meta.columns:
-        train_with_meta, val_with_meta = _train_and_apply_model_with_preprocessed(
-            train_preprocessed, val_preprocessed,
-            "prev_flight_total_duration", "predicted_prev_flight_total_duration",
-            model_config, verbose
-        )
+    # Train and apply taxi_time model (actually predicting turnover time: current dep - prev arr)
+    # Only if prediction doesn't already exist
+    if "prev_flight_taxi_time" not in existing_pred_cols:
+        if _check_target_column(train_preprocessed, "prev_flight_taxi_time", "prev_flight_turnover_time"):
+            train_with_meta, val_with_meta = _train_and_apply_model_with_preprocessed(
+                train_preprocessed, val_preprocessed,
+                "prev_flight_taxi_time", "predicted_prev_flight_turnover_time",
+                model_config, verbose,
+                train_with_meta=train_with_meta, val_with_meta=val_with_meta
+            )
+        else:
+            if verbose:
+                print(f"  ⏭ Skipping prev_flight_turnover_time model (target column invalid)")
+    else:
+        if verbose:
+            print(f"  ⏭ Skipping prev_flight_turnover_time model (prediction already exists: {existing_pred_cols['prev_flight_taxi_time']})")
     
-    # Rename prediction columns to include model_id
+    # Train and apply air_time model LAST (only if prediction doesn't already exist)
+    # Swapped order: air_time is now last to avoid potential positional issues
+    if "prev_flight_air_time" not in existing_pred_cols:
+        if _check_target_column(train_preprocessed, "prev_flight_air_time", "prev_flight_air_time"):
+            train_with_meta, val_with_meta = _train_and_apply_model_with_preprocessed(
+                train_preprocessed, val_preprocessed,
+                "prev_flight_air_time", "predicted_prev_flight_air_time",
+                model_config, verbose,
+                train_with_meta=train_with_meta, val_with_meta=val_with_meta
+            )
+        else:
+            if verbose:
+                print(f"  ⏭ Skipping prev_flight_air_time model (target column invalid)")
+    else:
+        if verbose:
+            print(f"  ⏭ Skipping prev_flight_air_time model (prediction already exists: {existing_pred_cols['prev_flight_air_time']})")
+    
+    # Rename prediction columns to include model_id (only if they don't already have it)
     prediction_cols = [
-        "predicted_prev_flight_air_time",
-        "predicted_prev_flight_taxi_time",
-        "predicted_prev_flight_total_duration"
+        ("predicted_prev_flight_air_time", f"predicted_prev_flight_air_time_{model_id}"),
+        ("predicted_prev_flight_turnover_time", f"predicted_prev_flight_turnover_time_{model_id}"),  # Note: This is turnover time (current dep - prev arr), not raw taxi time
+        ("predicted_prev_flight_total_duration", f"predicted_prev_flight_total_duration_{model_id}")
     ]
     
-    for col_name in prediction_cols:
-        if col_name in train_with_meta.columns:
-            new_name = f"{col_name}_{model_id}"
-            train_with_meta = train_with_meta.withColumnRenamed(col_name, new_name)
-            val_with_meta = val_with_meta.withColumnRenamed(col_name, new_name)
+    if verbose:
+        print(f"\n  🔍 Renaming prediction columns to include model_id '{model_id}':")
+    
+    renamed_cols = []
+    for col_name, final_name in prediction_cols:
+        # Check if column already has the model_id suffix (from existing predictions)
+        if final_name in train_with_meta.columns and final_name in val_with_meta.columns:
+            renamed_cols.append(final_name)
+            if verbose:
+                print(f"    ✓ {final_name} (already has model_id suffix - keeping as-is)")
+        elif col_name in train_with_meta.columns:
+            # Rename to add model_id suffix
+            train_with_meta = train_with_meta.withColumnRenamed(col_name, final_name)
+            val_with_meta = val_with_meta.withColumnRenamed(col_name, final_name)
+            renamed_cols.append(final_name)
+            if verbose:
+                print(f"    ✓ {col_name} → {final_name}")
+        else:
+            if verbose:
+                print(f"    ✗ {col_name} (not found - model may not have trained)")
+    
+    if verbose:
+        print(f"\n  🔍 Final prediction columns in DataFrame:")
+        for col_name in renamed_cols:
+            in_train = col_name in train_with_meta.columns
+            in_val = col_name in val_with_meta.columns
+            status = "✓" if (in_train and in_val) else "✗"
+            print(f"    {status} {col_name} (train={in_train}, val={in_val})")
+        
+        if len(renamed_cols) == 0:
+            print(f"    ⚠ WARNING: No prediction columns were created!")
+        elif len(renamed_cols) < len(prediction_cols):
+            print(f"    ⚠ WARNING: Only {len(renamed_cols)}/{len(prediction_cols)} prediction columns created!")
+        else:
+            print(f"    ✅ SUCCESS: All {len(renamed_cols)} prediction columns created and renamed!")
     
     # Unpersist cached preprocessed DataFrames to free memory
     if train_preprocessed.is_cached:
@@ -319,9 +626,101 @@ def compute_meta_model_predictions(train_df, val_df, model_id="RF_1", verbose=Tr
         end_time = datetime.now()
         duration = end_time - start_time
         timestamp = end_time.strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{timestamp}] ✓ Meta-model predictions complete! (took {duration})")
+        print(f"\n[{timestamp}] ✓ Meta-model predictions complete! (took {duration})")
+        
+        # Final summary of prediction columns
+        print(f"\n{'='*80}")
+        print("PREDICTION COLUMN CREATION SUMMARY:")
+        print(f"{'='*80}")
+        expected_final_cols = [
+            f"predicted_prev_flight_air_time_{model_id}",
+            f"predicted_prev_flight_turnover_time_{model_id}",
+            f"predicted_prev_flight_total_duration_{model_id}"
+        ]
+        
+        for col_name in expected_final_cols:
+            in_train = col_name in train_with_meta.columns
+            in_val = col_name in val_with_meta.columns
+            status = "✅" if (in_train and in_val) else "❌"
+            print(f"  {status} {col_name}")
+            if in_train and in_val:
+                # Check non-null counts
+                train_non_null = train_with_meta.filter(col(col_name).isNotNull()).count()
+                val_non_null = val_with_meta.filter(col(col_name).isNotNull()).count()
+                train_total = train_with_meta.count()
+                val_total = val_with_meta.count()
+                print(f"      Train: {train_non_null:,}/{train_total:,} non-null ({train_non_null/train_total*100:.1f}%)")
+                print(f"      Val: {val_non_null:,}/{val_total:,} non-null ({val_non_null/val_total*100:.1f}%)")
+            else:
+                print(f"      ⚠ Missing in {'train' if not in_train else ''}{' and ' if (not in_train and not in_val) else ''}{'val' if not in_val else ''}")
+        
+        success_count = sum(1 for col_name in expected_final_cols 
+                          if col_name in train_with_meta.columns and col_name in val_with_meta.columns)
+        print(f"\n  Result: {success_count}/{len(expected_final_cols)} prediction columns successfully created")
+        if success_count == len(expected_final_cols):
+            print(f"  ✅ SUCCESS: All prediction columns are ready to save!")
+        else:
+            print(f"  ⚠ WARNING: {len(expected_final_cols) - success_count} prediction column(s) missing!")
+        print(f"{'='*80}\n")
     
     return train_with_meta, val_with_meta
+
+
+def _retry_with_backoff(func, max_retries=MAX_RETRIES, initial_delay=INITIAL_RETRY_DELAY, verbose=True):
+    """
+    Retry a function with exponential backoff for transient cluster failures.
+    
+    Args:
+        func: Function to retry (should be a callable that takes no args)
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds (doubles each retry)
+        verbose: Whether to print retry messages
+    
+    Returns:
+        Result of func()
+    
+    Raises:
+        Last exception if all retries fail
+    """
+    last_exception = None
+    
+    for attempt in range(max_retries + 1):
+        try:
+            return func()
+        except Exception as e:
+            error_str = str(e).lower()  # Case-insensitive matching
+            # Also check error message/description if available
+            error_msg = ""
+            if hasattr(e, 'java_exception'):
+                try:
+                    error_msg = str(e.java_exception.getMessage()).lower()
+                except:
+                    pass
+            if hasattr(e, 'msg'):
+                error_msg = str(e.msg).lower()
+            
+            # Check if any retryable error pattern matches (case-insensitive)
+            is_retryable = any(
+                err.lower() in error_str or err.lower() in error_msg
+                for err in RETRYABLE_ERRORS
+            )
+            
+            if attempt < max_retries and is_retryable:
+                delay = initial_delay * (2 ** attempt)
+                if verbose:
+                    print(f"  ⚠ Retryable error (attempt {attempt + 1}/{max_retries + 1}): {type(e).__name__}")
+                    print(f"  ⏳ Waiting {delay}s before retry...")
+                time.sleep(delay)
+                last_exception = e
+            else:
+                # Not retryable or out of retries
+                if not is_retryable and verbose:
+                    print(f"  ❌ Non-retryable error: {type(e).__name__}")
+                raise
+    
+    # Should never reach here, but just in case
+    if last_exception:
+        raise last_exception
 
 
 def _get_shared_features(df):
@@ -387,9 +786,25 @@ def _build_shared_preprocessing_pipeline(categorical_features, numerical_feature
 
 
 def _train_and_apply_model_with_preprocessed(train_preprocessed, val_preprocessed, 
-                                              target_col, pred_col_name, model_config, verbose):
-    """Train a single meta-model using preprocessed data and apply to both train and val."""
-    # Filter to rows with valid target
+                                              target_col, pred_col_name, model_config, verbose,
+                                              train_with_meta=None, val_with_meta=None):
+    """
+    Train a single meta-model using preprocessed data and apply to both train and val.
+    
+    Args:
+        train_preprocessed: Preprocessed training DataFrame (for training the model)
+        val_preprocessed: Preprocessed validation DataFrame (for training the model)
+        target_col: Target column name
+        pred_col_name: Final prediction column name
+        model_config: Model configuration dict
+        verbose: Whether to print verbose output
+        train_with_meta: Optional DataFrame with existing predictions (will be joined with new predictions)
+        val_with_meta: Optional DataFrame with existing predictions (will be joined with new predictions)
+    
+    Returns:
+        tuple: (train_df_with_predictions, val_df_with_predictions)
+    """
+    # Filter to rows with valid target (use preprocessed for training)
     train_filtered = train_preprocessed.filter(col(target_col).isNotNull())
     
     # Optional: Sample training data for very large datasets (60M)
@@ -415,6 +830,30 @@ def _train_and_apply_model_with_preprocessed(train_preprocessed, val_preprocesse
     if verbose:
         print(f"  Training {target_col} model ({count:,} rows, {len(processed_categorical)} cat, {len(processed_numerical)} num)")
     
+    # Adaptive complexity: Reduce model complexity for very large datasets to avoid resource issues
+    # Fold 4 (test fold) has ~15.9M training rows - needs lighter model
+    # Balance: With more data, simpler models can still achieve good accuracy
+    base_num_rounds = model_config.get("num_boost_round", 75)
+    base_max_depth = model_config.get("max_depth", 6)
+    
+    if count > 10_000_000:  # >10M rows: moderate reduction (more data compensates for simpler model)
+        num_rounds = max(50, int(base_num_rounds * 0.67))  # ~67% of base (50 rounds), at least 50
+        max_depth = max(5, base_max_depth - 1)  # Depth 5 (1 less than base), at least 5
+        if verbose:
+            print(f"    ⚠ Large dataset detected ({count:,} rows) - moderate complexity reduction:")
+            print(f"      num_boost_round: {base_num_rounds} → {num_rounds} (more data compensates)")
+            print(f"      max_depth: {base_max_depth} → {max_depth}")
+    elif count > 5_000_000:  # 5-10M rows: slight reduction
+        num_rounds = max(60, int(base_num_rounds * 0.8))  # 80% of base (60 rounds), at least 60
+        max_depth = base_max_depth  # Keep full depth
+        if verbose:
+            print(f"    ⚠ Medium-large dataset ({count:,} rows) - slight complexity reduction:")
+            print(f"      num_boost_round: {base_num_rounds} → {num_rounds}")
+            print(f"      max_depth: {base_max_depth} (unchanged)")
+    else:
+        num_rounds = base_num_rounds
+        max_depth = base_max_depth
+    
     # Cache the training DataFrame to avoid recomputation during Random Forest training
     if not train_filtered.is_cached:
         if verbose:
@@ -435,18 +874,38 @@ def _train_and_apply_model_with_preprocessed(train_preprocessed, val_preprocesse
     from pyspark import SparkContext
     sc = SparkContext.getOrCreate()
     
+    # Dynamically determine number of workers (cap at available executors to avoid barrier errors)
+    # XGBoost requires num_workers <= available executor slots
+    requested_workers = sc.defaultParallelism
+    # num_rounds and max_depth are now set adaptively above based on dataset size
+    
+    # Get actual number of executors (fallback to requested if unavailable)
+    try:
+        # Try to get executor count from Spark context
+        executor_infos = sc.statusTracker().getExecutorInfos()
+        executor_count = len([e for e in executor_infos if e.isActive])
+        # XGBoost typically needs num_workers <= executor_count
+        # Use min of requested and available, but at least 1
+        num_workers = max(1, min(requested_workers, executor_count))
+        if num_workers < requested_workers and verbose:
+            print(f"      ⚠ Adjusted num_workers from {requested_workers} to {num_workers} (available executors: {executor_count})")
+    except Exception as e:
+        # Fallback: use requested workers, but cap at reasonable number
+        num_workers = min(requested_workers, 30)  # Cap at 30 to avoid barrier errors and timeouts (reduced from 50)
+        if verbose:
+            print(f"      Using num_workers={num_workers} (could not detect executor count: {str(e)[:50]})")
+    
     # XGBoost Regressor (much faster than Random Forest)
-    # Note: SparkXGBRegressor may use 'n_estimators' instead of 'num_boost_round'
-    # If num_boost_round doesn't work, try n_estimators
-    num_rounds = model_config.get("num_boost_round", 75)
+    # Use unique temporary prediction column name to avoid overwriting between models
+    temp_pred_col = f"_temp_prediction_{target_col.replace('prev_flight_', '')}"
     model = SparkXGBRegressor(
-        num_workers=sc.defaultParallelism,
+        num_workers=num_workers,
         label_col=target_col,
         features_col="features",
-        prediction_col="prediction",
+        prediction_col=temp_pred_col,  # Use unique temp name to avoid overwriting
         missing=0.0,
-        num_boost_round=num_rounds,  # Try this first
-        max_depth=model_config.get("max_depth", 6),
+        num_boost_round=num_rounds,
+        max_depth=max_depth,
         learning_rate=model_config.get("learning_rate", 0.15),
         min_child_weight=model_config.get("min_child_weight", 1),
         seed=42
@@ -454,7 +913,7 @@ def _train_and_apply_model_with_preprocessed(train_preprocessed, val_preprocesse
     
     # Log actual parameter being used for debugging
     if verbose:
-        print(f"      Using num_boost_round={num_rounds} (check XGBoost logs to confirm)")
+        print(f"      Using num_boost_round={num_rounds}, num_workers={num_workers}")
     
     # Build model pipeline (preprocessing already done)
     model_pipeline = Pipeline(stages=[assembler, model])
@@ -464,10 +923,21 @@ def _train_and_apply_model_with_preprocessed(train_preprocessed, val_preprocesse
         fit_start = datetime.now()
         fit_timestamp = fit_start.strftime("%Y-%m-%d %H:%M:%S")
         print(f"    [{fit_timestamp}] Starting XGBoost training (this may take 2-10 minutes)...")
-        print(f"      Config: {model_config.get('num_boost_round', 75)} rounds, max_depth={model_config.get('max_depth', 6)}, learning_rate={model_config.get('learning_rate', 0.15)}")
+        print(f"      Config: {num_rounds} rounds, max_depth={max_depth}, learning_rate={model_config.get('learning_rate', 0.15)}")
     
-    # Train
-    fitted_model = model_pipeline.fit(train_filtered)
+    # Suppress verbose XGBoost logging (booster params, train_call_kwargs, etc.)
+    xgboost_logger = logging.getLogger("XGBoost-PySpark")
+    original_level = xgboost_logger.level if xgboost_logger.level != logging.NOTSET else logging.INFO
+    xgboost_logger.setLevel(logging.WARNING)  # Only show warnings and errors, suppress INFO logs
+    
+    # Train (with retry for cluster failures)
+    def _fit_model():
+        return model_pipeline.fit(train_filtered)
+    
+    fitted_model = _retry_with_backoff(_fit_model, verbose=verbose)
+    
+    # Restore original logging level
+    xgboost_logger.setLevel(original_level)
     
     # Log duration
     if verbose:
@@ -479,24 +949,31 @@ def _train_and_apply_model_with_preprocessed(train_preprocessed, val_preprocesse
     if train_filtered.is_cached:
         train_filtered.unpersist()
     
-    # Apply to both train and val (inference step - can take time on large datasets)
+    # Apply to both train and val (inference step - can take time on large datasets, with retry)
     if verbose:
         inf_start = datetime.now()
         inf_timestamp = inf_start.strftime("%Y-%m-%d %H:%M:%S")
         print(f"    [{inf_timestamp}] Applying predictions to train and validation sets...")
     
-    train_with_pred = fitted_model.transform(train_preprocessed)
-    val_with_pred = fitted_model.transform(val_preprocessed)
+    def _transform_train():
+        return fitted_model.transform(train_preprocessed)
+    
+    def _transform_val():
+        return fitted_model.transform(val_preprocessed)
+    
+    train_with_pred = _retry_with_backoff(_transform_train, verbose=verbose)
+    val_with_pred = _retry_with_backoff(_transform_val, verbose=verbose)
     
     if verbose:
         inf_end = datetime.now()
         inf_duration = (inf_end - inf_start).total_seconds()
         print(f"    ✓ Inference complete (took {inf_duration:.1f}s / {inf_duration/60:.1f}min)")
     
-    # Rename prediction column
-    if "prediction" in train_with_pred.columns:
-        train_with_pred = train_with_pred.withColumnRenamed("prediction", pred_col_name)
-        val_with_pred = val_with_pred.withColumnRenamed("prediction", pred_col_name)
+    # Extract prediction column and add to train_with_meta/val_with_meta (preserving existing predictions)
+    if temp_pred_col in train_with_pred.columns:
+        # Rename prediction column from unique temp name to final name
+        train_with_pred = train_with_pred.withColumnRenamed(temp_pred_col, pred_col_name)
+        val_with_pred = val_with_pred.withColumnRenamed(temp_pred_col, pred_col_name)
         
         # Impute NULLs with fallback
         if target_col == "prev_flight_air_time":
@@ -512,14 +989,57 @@ def _train_and_apply_model_with_preprocessed(train_preprocessed, val_preprocesse
         val_with_pred = val_with_pred.withColumn(
             pred_col_name, coalesce(col(pred_col_name), fallback)
         )
-    
-    # Drop intermediate columns (keep preprocessed columns for other models, but drop features vector)
-    if "features" in train_with_pred.columns:
-        train_with_pred = train_with_pred.drop("features")
-        val_with_pred = val_with_pred.drop("features")
+        
+        # Add prediction column to train_with_meta/val_with_meta (preserving existing predictions)
+        if train_with_meta is not None and val_with_meta is not None:
+            # Since train_preprocessed and train_with_meta started from the same source,
+            # they should have the same rows in the same order. Use a stable join key.
+            # Find columns that exist in both DataFrames (excluding the new prediction column)
+            common_cols = [c for c in train_preprocessed.columns 
+                          if c in train_with_meta.columns and c not in ["features", pred_col_name]]
+            
+            # Use these common columns as join keys (should be unique enough)
+            # If we have enough columns, this should work. Otherwise fall back to row_number.
+            if len(common_cols) > 0:
+                # Join on common columns
+                train_with_meta = train_with_meta.join(
+                    train_with_pred.select(common_cols + [pred_col_name]),
+                    on=common_cols,
+                    how="left"
+                )
+                val_with_meta = val_with_meta.join(
+                    val_with_pred.select(common_cols + [pred_col_name]),
+                    on=common_cols,
+                    how="left"
+                )
+            else:
+                # Fallback: use row_number (less efficient but works)
+                from pyspark.sql.window import Window
+                from pyspark.sql.functions import row_number
+                
+                window_spec = Window.orderBy(F.monotonically_increasing_id())
+                train_with_pred = train_with_pred.withColumn("_join_key", row_number().over(window_spec))
+                val_with_pred = val_with_pred.withColumn("_join_key", row_number().over(window_spec))
+                train_with_meta = train_with_meta.withColumn("_join_key", row_number().over(window_spec))
+                val_with_meta = val_with_meta.withColumn("_join_key", row_number().over(window_spec))
+                
+                train_with_meta = train_with_meta.join(
+                    train_with_pred.select("_join_key", pred_col_name),
+                    on="_join_key",
+                    how="left"
+                ).drop("_join_key")
+                val_with_meta = val_with_meta.join(
+                    val_with_pred.select("_join_key", pred_col_name),
+                    on="_join_key",
+                    how="left"
+                ).drop("_join_key")
+        else:
+            # First model - use transformed DataFrames but drop features
+            train_with_meta = train_with_pred.drop("features") if "features" in train_with_pred.columns else train_with_pred
+            val_with_meta = val_with_pred.drop("features") if "features" in val_with_pred.columns else val_with_pred
     
     # Note: Completion message already printed above after training
-    return train_with_pred, val_with_pred
+    return train_with_meta, val_with_meta
 
 
 # -------------------------
@@ -535,6 +1055,12 @@ def add_meta_model_predictions_to_folds(version: str, input_suffix: str = "_with
     print(f"Input suffix: {input_suffix}")
     print(f"Output suffix: {OUTPUT_SUFFIX}")
     print(f"Meta-model IDs: {list(META_MODEL_IDS.keys())}")
+    print(f"Retry configuration: {MAX_RETRIES} max retries, {INITIAL_RETRY_DELAY}s initial delay (exponential backoff)")
+    if SKIP_EXISTING_FOLDS:
+        print(f"  ✓ Resume mode: ENABLED (will skip completed folds)")
+    else:
+        print(f"  ⚠ Resume mode: DISABLED (will re-run all folds)")
+        print(f"  💡 Tip: Set SKIP_EXISTING_FOLDS=True for overnight runs to auto-resume after failures")
     
     # Load all available folds (same pattern as cv.py dataloader)
     folds = load_folds_for_version(version, input_suffix)
@@ -560,9 +1086,11 @@ def add_meta_model_predictions_to_folds(version: str, input_suffix: str = "_with
         print(f"{'='*60}")
         
         # Check if fold already exists (resume mode)
-        if SKIP_EXISTING_FOLDS and fold_exists(version, fold_idx, OUTPUT_SUFFIX, fold_type):
+        # Pass expected_model_ids to verify all meta-model predictions are present
+        if SKIP_EXISTING_FOLDS and fold_exists(version, fold_idx, OUTPUT_SUFFIX, fold_type, 
+                                                expected_model_ids=list(META_MODEL_IDS.keys())):
             if VERBOSE:
-                print(f"  ⏭ Skipping fold {fold_idx} (already exists in output)")
+                print(f"  ⏭ Skipping fold {fold_idx} (already exists with all expected meta-model predictions)")
             print(f"✅ Fold {fold_idx} skipped (already complete)")
             skipped_count += 1
             continue
@@ -581,14 +1109,29 @@ def add_meta_model_predictions_to_folds(version: str, input_suffix: str = "_with
             if VERBOSE:
                 print(f"\n  Computing meta-model predictions: {model_id}")
             
-            try:
-                train_with_meta, val_or_test_with_meta = compute_meta_model_predictions(
+            # Retry meta-model computation with exponential backoff
+            def _compute_meta_models():
+                return compute_meta_model_predictions(
                     train_with_meta, val_or_test_with_meta, 
                     model_id=model_id, 
                     verbose=VERBOSE
                 )
+            
+            try:
+                train_with_meta, val_or_test_with_meta = _retry_with_backoff(
+                    _compute_meta_models, 
+                    verbose=VERBOSE
+                )
             except Exception as e:
-                print(f"  ❌ ERROR: Meta-model {model_id} failed: {str(e)}")
+                error_str = str(e)
+                is_retryable = any(err in error_str for err in RETRYABLE_ERRORS)
+                
+                if is_retryable:
+                    print(f"  ❌ ERROR: Meta-model {model_id} failed after {MAX_RETRIES} retries")
+                    print(f"  💡 Tip: Enable SKIP_EXISTING_FOLDS=True and re-run to resume from completed folds")
+                else:
+                    print(f"  ❌ ERROR: Meta-model {model_id} failed with non-retryable error")
+                
                 raise RuntimeError(f"Meta-model precomputation failed for {model_id}. Error: {str(e)}") from e
         
         # Save (checkpoint after each fold - allows resume if interrupted)
@@ -628,4 +1171,3 @@ for version in VERSIONS:
 print("\n" + "="*80)
 print("✅ All versions processed successfully!")
 print("="*80)
-

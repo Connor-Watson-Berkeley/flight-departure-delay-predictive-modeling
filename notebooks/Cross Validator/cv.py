@@ -68,6 +68,10 @@ class FlightDelayDataLoader:
             'distance',
             'elevation',
             
+            # Meta Models
+            'predicted_prev_flight_total_duration_XGB_1', # NEW!
+            'predicted_prev_flight_air_time_XGB_1', # Coming Soon!
+            'predicted_prev_flight_turnover_time_XGB_1', # Coming Soon!
             # Flight lineage features
             'lineage_rank',
             'prev_flight_dep_delay',
@@ -342,6 +346,7 @@ class FlightDelayCV:
             # ADDED_BY_SID_START
             # CRITICAL: Clean up after EVERY fold
             print(f"Cleaning up fold {i}...")
+            spark = SparkSession.builder.getOrCreate() 
             spark.catalog.clearCache()
             
             try:

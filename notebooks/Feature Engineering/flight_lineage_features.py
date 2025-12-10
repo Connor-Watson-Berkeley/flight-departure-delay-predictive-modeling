@@ -395,7 +395,10 @@ def _compute_cumulative_features(df, tail_num_col):
         ).otherwise(None)
     )
     
-    window_spec_cumulative = Window.partitionBy(tail_num_col).orderBy(F.col('arrival_timestamp').asc_nulls_last()).rowsBetween(Window.unboundedPreceding, -1)
+    # Cumulative features: Look at flights BEFORE the immediate previous flight (exclude flight n-1)
+    # This reduces data leakage risk since we're not using the immediate previous flight's delay
+    # Use -2 instead of -1 to exclude the immediate previous flight
+    window_spec_cumulative = Window.partitionBy(tail_num_col).orderBy(F.col('arrival_timestamp').asc_nulls_last()).rowsBetween(Window.unboundedPreceding, -2)
     df = df.withColumn('lineage_cumulative_delay', F.sum('dep_delay').over(window_spec_cumulative))
     df = df.withColumn('lineage_num_previous_flights', F.count('*').over(window_spec_cumulative))
     df = df.withColumn('lineage_avg_delay_previous_flights', F.avg('dep_delay').over(window_spec_cumulative))
@@ -948,7 +951,11 @@ def _check_data_leakage(df):
     df = df.withColumn('has_leakage_lineage_actual_taxi_time_minutes', col('has_leakage_lineage_actual_turnover_time_minutes'))
     df = df.withColumn('has_leakage_lineage_actual_turn_time_minutes', col('has_leakage_lineage_actual_turnover_time_minutes'))
     
-    # Cumulative features are derived from actual delays, which inherit leakage from actual_dep_time
+    # Cumulative features: Look at flights BEFORE the immediate previous flight (exclude flight n-1)
+    # These are much safer since they don't use the immediate previous flight's delay
+    # However, they may still have leakage if any of the earlier flights haven't completed yet
+    # For now, mark as having leakage only if the immediate previous flight has leakage
+    # (This is conservative - in practice, flights before n-1 have usually completed)
     df = df.withColumn('has_leakage_lineage_cumulative_delay', col('has_leakage_prev_flight_dep_delay'))
     df = df.withColumn('has_leakage_lineage_avg_delay_previous_flights', col('has_leakage_prev_flight_dep_delay'))
     df = df.withColumn('has_leakage_lineage_max_delay_previous_flights', col('has_leakage_prev_flight_dep_delay'))
@@ -1111,9 +1118,11 @@ def _apply_imputation(df):
     df = df.withColumn('lineage_actual_turnover_time_minutes', F.coalesce(col('lineage_actual_turnover_time_minutes'), F.lit(LARGE_TURNOVER_TIME_MINUTES)))
     df = df.withColumn('lineage_actual_taxi_time_minutes', F.coalesce(col('lineage_actual_taxi_time_minutes'), col('lineage_actual_turnover_time_minutes')))
     df = df.withColumn('lineage_actual_turn_time_minutes', F.coalesce(col('lineage_actual_turn_time_minutes'), col('lineage_actual_turnover_time_minutes')))
+    # Impute NULLs for cumulative features (when no flights exist before n-1)
+    # Mean delay (9.37 minutes) was identified from EDA as the average departure delay across all flights
     df = df.withColumn('lineage_cumulative_delay', F.coalesce(col('lineage_cumulative_delay'), F.lit(0.0)))
-    df = df.withColumn('lineage_avg_delay_previous_flights', F.coalesce(col('lineage_avg_delay_previous_flights'), F.lit(-10.0)))
-    df = df.withColumn('lineage_max_delay_previous_flights', F.coalesce(col('lineage_max_delay_previous_flights'), F.lit(-10.0)))
+    df = df.withColumn('lineage_avg_delay_previous_flights', F.coalesce(col('lineage_avg_delay_previous_flights'), F.lit(9.37)))
+    df = df.withColumn('lineage_max_delay_previous_flights', F.coalesce(col('lineage_max_delay_previous_flights'), F.lit(0.0)))
     df = df.withColumn('lineage_num_previous_flights', F.coalesce(col('lineage_num_previous_flights'), F.lit(0)))
     df = df.withColumn('lineage_expected_flight_time_minutes', F.coalesce(col('lineage_expected_flight_time_minutes'), col('crs_elapsed_time')))
     
