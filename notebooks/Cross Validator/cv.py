@@ -269,6 +269,12 @@ class FlightDelayEvaluator:
             labelCol=numeric_label_col,
             metricName="rmse"
         )
+        
+        self.mae_evaluator = RegressionEvaluator(
+            predictionCol=prediction_col,
+            labelCol=numeric_label_col,
+            metricName="mae"
+        )
 
     def calculate_rmse(self, predictions_df):
         # Drop any residual nulls before RegressionEvaluator sees them
@@ -276,6 +282,13 @@ class FlightDelayEvaluator:
             subset=[self.numeric_label_col, self.prediction_col]
         )
         return self.rmse_evaluator.evaluate(clean)
+    
+    def calculate_mae(self, predictions_df):
+        # Drop any residual nulls before RegressionEvaluator sees them
+        clean = predictions_df.dropna(
+            subset=[self.numeric_label_col, self.prediction_col]
+        )
+        return self.mae_evaluator.evaluate(clean)
 
     def _calculate_classification_metrics(self, predictions_df, threshold, label_col):
         # Null-safe for classification too
@@ -335,6 +348,7 @@ class FlightDelayEvaluator:
         
         return {
             "rmse": self.calculate_rmse(predictions_df),
+            "mae": self.calculate_mae(predictions_df),
             "otpa": otpa_metrics["accuracy"],  # Backwards compatibility
             "otpa_precision": otpa_metrics["precision"],
             "otpa_recall": otpa_metrics["recall"],
@@ -377,6 +391,8 @@ class FlightDelayCV:
         self.models = []
         self.test_metric = None
         self.test_model = None
+        self.fit_results = None  # Store results DataFrame from fit()
+        self.evaluate_results = None  # Store results DataFrame from evaluate()
     
     def fit(self):
         # CV folds only (exclude last test fold)
@@ -450,6 +466,7 @@ class FlightDelayCV:
             formatted_results.append({
                 'Fold': f"{fold} Train",
                 'rmse': result['rmse_train'],
+                'mae': result.get('mae_train', None),
                 'otpa': result['otpa_train'],
                 'otpa_precision': result.get('otpa_precision_train', None),
                 'otpa_recall': result.get('otpa_recall_train', None),
@@ -463,6 +480,7 @@ class FlightDelayCV:
             formatted_results.append({
                 'Fold': f"{fold} Val",
                 'rmse': result['rmse_val'],
+                'mae': result.get('mae_val', None),
                 'otpa': result['otpa_val'],
                 'otpa_precision': result.get('otpa_precision_val', None),
                 'otpa_recall': result.get('otpa_recall_val', None),
@@ -482,6 +500,7 @@ class FlightDelayCV:
         mean_train = pd.DataFrame([{
             'Fold': 'Mean Train',
             'rmse': train_rows['rmse'].mean(),
+            'mae': train_rows['mae'].mean() if 'mae' in train_rows.columns else None,
             'otpa': train_rows['otpa'].mean(),
             'otpa_precision': train_rows['otpa_precision'].mean() if 'otpa_precision' in train_rows.columns else None,
             'otpa_recall': train_rows['otpa_recall'].mean() if 'otpa_recall' in train_rows.columns else None,
@@ -495,6 +514,7 @@ class FlightDelayCV:
         std_train = pd.DataFrame([{
             'Fold': 'Std Train',
             'rmse': train_rows['rmse'].std(),
+            'mae': train_rows['mae'].std() if 'mae' in train_rows.columns else None,
             'otpa': train_rows['otpa'].std(),
             'otpa_precision': train_rows['otpa_precision'].std() if 'otpa_precision' in train_rows.columns else None,
             'otpa_recall': train_rows['otpa_recall'].std() if 'otpa_recall' in train_rows.columns else None,
@@ -508,6 +528,7 @@ class FlightDelayCV:
         mean_val = pd.DataFrame([{
             'Fold': 'Mean Val',
             'rmse': val_rows['rmse'].mean(),
+            'mae': val_rows['mae'].mean() if 'mae' in val_rows.columns else None,
             'otpa': val_rows['otpa'].mean(),
             'otpa_precision': val_rows['otpa_precision'].mean() if 'otpa_precision' in val_rows.columns else None,
             'otpa_recall': val_rows['otpa_recall'].mean() if 'otpa_recall' in val_rows.columns else None,
@@ -521,6 +542,7 @@ class FlightDelayCV:
         std_val = pd.DataFrame([{
             'Fold': 'Std Val',
             'rmse': val_rows['rmse'].std(),
+            'mae': val_rows['mae'].std() if 'mae' in val_rows.columns else None,
             'otpa': val_rows['otpa'].std(),
             'otpa_precision': val_rows['otpa_precision'].std() if 'otpa_precision' in val_rows.columns else None,
             'otpa_recall': val_rows['otpa_recall'].std() if 'otpa_recall' in val_rows.columns else None,
@@ -532,6 +554,7 @@ class FlightDelayCV:
         }])
         
         m = pd.concat([m, mean_train, std_train, mean_val, std_val], ignore_index=True)
+        self.fit_results = m  # Store results for later retrieval
         return m
 
     def evaluate(self, use_fold_3_val_train=False):
@@ -596,6 +619,7 @@ class FlightDelayCV:
             {
                 'Split': 'Train',
                 'rmse': train_metric['rmse'],
+                'mae': train_metric.get('mae', None),
                 'otpa': train_metric['otpa'],
                 'otpa_precision': train_metric.get('otpa_precision', None),
                 'otpa_recall': train_metric.get('otpa_recall', None),
@@ -608,6 +632,7 @@ class FlightDelayCV:
             {
                 'Split': 'Test',
                 'rmse': test_metric['rmse'],
+                'mae': test_metric.get('mae', None),
                 'otpa': test_metric['otpa'],
                 'otpa_precision': test_metric.get('otpa_precision', None),
                 'otpa_recall': test_metric.get('otpa_recall', None),
@@ -619,7 +644,22 @@ class FlightDelayCV:
             }
         ])
         
+        self.evaluate_results = results  # Store results for later retrieval
         return results
+    
+    def get_results(self):
+        """
+        Return stored results from fit() and/or evaluate().
+        
+        Returns:
+            dict: Contains:
+                - "fit_results": pd.DataFrame with cross-validation results (if fit() was called)
+                - "evaluate_results": pd.DataFrame with test results (if evaluate() was called)
+        """
+        return {
+            "fit_results": self.fit_results,
+            "evaluate_results": self.evaluate_results
+        }
     
     def benchmark_inference(self, dataset="cv_folds", model=None, return_predictions=False):
         """
