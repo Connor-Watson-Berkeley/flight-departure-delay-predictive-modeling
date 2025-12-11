@@ -29,7 +29,7 @@ from xgboost.spark import SparkXGBRegressor
 # CONFIGURATION
 # -------------------------
 # List of versions to process (e.g., ["3M", "12M", "60M", "XM"])
-VERSIONS = ["60M", "12M"]  # <-- EDIT THIS LIST
+VERSIONS = ["3M","60M","12M"]  # <-- EDIT THIS LIST
 
 INPUT_FOLDER = "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed"
 OUTPUT_FOLDER = "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed"
@@ -1304,4 +1304,3 @@ for version in VERSIONS:
 print("\n" + "="*80)
 print("✅ All versions processed successfully!")
 print("="*80)
-
