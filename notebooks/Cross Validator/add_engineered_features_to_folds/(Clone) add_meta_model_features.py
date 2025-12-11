@@ -29,11 +29,11 @@ from xgboost.spark import SparkXGBRegressor
 # CONFIGURATION
 # -------------------------
 # List of versions to process (e.g., ["3M", "12M", "60M", "XM"])
-VERSIONS = ["60M", "12M"]  # <-- EDIT THIS LIST
+VERSIONS = ["3M"]  # <-- EDIT THIS LIST
 
 INPUT_FOLDER = "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed"
 OUTPUT_FOLDER = "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed"
-SOURCE = "CUSTOM"
+SOURCE = "OTPW"
 WRITE_MODE = "overwrite"
 VERBOSE = True
 OUTPUT_SUFFIX = "_with_graph_and_metamodels"

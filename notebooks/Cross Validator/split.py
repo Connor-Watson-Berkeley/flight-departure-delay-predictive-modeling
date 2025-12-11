@@ -34,18 +34,31 @@ spec.loader.exec_module(flight_lineage_features)
 # -------------------------
 # HARD-CODED SETTINGS
 # -------------------------
-DATASETS = {
-    "3M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_3m",
-    "12M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_2015",
-    # 60M: Created by Custom Join (full).ipynb with data_version="60m" for 2015-2019 data
-    # The Custom Join notebook filters to 2015-2019 at the beginning (Cell 13) for efficiency
-    # "60M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_60m"
-    "60M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_60M"
-}
-
 OUTPUT_FOLDER = "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed"
-SOURCE = "CUSTOM"
-DATE_COL = "FL_DATE"
+SOURCE = "OTPW"  # Change to "OTPW" when processing OTPW data
+DATE_COL = "FL_DATE"  # Default/preference - auto-detects actual column (FL_DATE for CUSTOM, fl_date for OTPW)
+
+# List of versions to assess (e.g., ["3M", "12M", "60M"])
+VERSIONS = ["60M"]  # <-- EDIT THIS LIST
+
+# Dataset paths - depends on SOURCE
+# When SOURCE="CUSTOM": Uses Custom Join outputs
+# When SOURCE="OTPW": Uses OTPW processed outputs (with _otpw suffix)
+if SOURCE == "OTPW":
+    DATASETS = {
+        "3M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_3m_otpw",
+        "12M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_2015_otpw",
+        "60M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_60M_otpw"
+    }
+else:  # SOURCE == "CUSTOM"
+    DATASETS = {
+        "3M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_3m",
+        "12M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_2015",
+        # 60M: Created by Custom Join (full).ipynb with data_version="60m" for 2015-2019 data
+        # The Custom Join notebook filters to 2015-2019 at the beginning (Cell 13) for efficiency
+        # "60M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_60m"
+        "60M": "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed/flights_weather_joined_60M"
+    }
 
 N_FOLDS = 3              # CV folds
 CREATE_TEST_FOLD = True  # adds one final test period
@@ -201,19 +214,43 @@ def save_folds_to_parquet(folds, version: str):
 if __name__ == "__main__":
     spark = SparkSession.builder.getOrCreate()
 
-    for version, path in DATASETS.items():
+    # Process only versions specified in VERSIONS list
+    for version in VERSIONS:
+        if version not in DATASETS:
+            print(f"⚠️  Warning: Version '{version}' not found in DATASETS. Skipping...")
+            print(f"   Available versions: {list(DATASETS.keys())}")
+            continue
+        
+        path = DATASETS[version]
         print(f"\n================= SPLITTING {version} =================")
         print(f"📥 Reading: {path}")
 
         df = spark.read.parquet(path)
         
         # Normalize date column for all versions (consistent processing)
-        df = df.withColumn(DATE_COL, F.to_date(F.col(DATE_COL)))
+        # Handle both FL_DATE (CUSTOM) and fl_date (OTPW after column mapping)
+        date_col_actual = None
+        if DATE_COL in df.columns:
+            date_col_actual = DATE_COL
+        elif DATE_COL.lower() in df.columns:
+            date_col_actual = DATE_COL.lower()
+        elif "fl_date" in df.columns:
+            date_col_actual = "fl_date"
+        elif "FL_DATE" in df.columns:
+            date_col_actual = "FL_DATE"
+        else:
+            raise ValueError(f"Date column not found. Expected '{DATE_COL}' or 'fl_date'. Available columns: {sorted(df.columns)[:20]}...")
+        
+        # Use the actual date column name found in the DataFrame
+        df = df.withColumn(date_col_actual, F.to_date(F.col(date_col_actual)))
+        
+        # Update DATE_COL to the actual column name for use in fold creation
+        date_col_for_folds = date_col_actual
         
         # Check actual date range in dataset (for validation)
         date_range = df.select(
-            F.min(F.col(DATE_COL)).alias("min_date"),
-            F.max(F.col(DATE_COL)).alias("max_date")
+            F.min(F.col(date_col_for_folds)).alias("min_date"),
+            F.max(F.col(date_col_for_folds)).alias("max_date")
         ).first()
         print(f"📅 Dataset date range: {date_range['min_date']} to {date_range['max_date']}")
         
@@ -222,8 +259,8 @@ if __name__ == "__main__":
         # Note: 60M is already filtered in Custom Join notebook, but we filter anyway to ensure consistency
         initial_count = df.count()
         df = df.filter(
-            (F.col(DATE_COL) >= F.lit("2015-01-01")) & 
-            (F.col(DATE_COL) < F.lit("2020-01-01"))
+            (F.col(date_col_for_folds) >= F.lit("2015-01-01")) & 
+            (F.col(date_col_for_folds) < F.lit("2020-01-01"))
         )
         filtered_count = df.count()
         removed = initial_count - filtered_count
@@ -236,7 +273,7 @@ if __name__ == "__main__":
 
         folds = create_sliding_window_folds(
             df=df,
-            date_col=DATE_COL,
+            date_col=date_col_for_folds,  # Use the actual date column name found
             n_folds=N_FOLDS,
             test_fold=CREATE_TEST_FOLD,
             verbose=VERBOSE

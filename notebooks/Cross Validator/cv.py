@@ -1,5 +1,5 @@
 """
-cv.py (CUSTOM-only, with fold strategy support)
+cv.py (CUSTOM or OTPW, with fold strategy support)
 
 Assumptions:
 - Folds were created from split.py with N_FOLDS = 3 and CREATE_TEST_FOLD = True
@@ -8,7 +8,18 @@ Assumptions:
 - Files live in:
     dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed
 - File naming:
-    OTPW_CUSTOM_{VERSION}_FOLD_{i}_{TRAIN|VAL|TEST}.parquet
+    OTPW_{SOURCE}_{VERSION}_FOLD_{i}_{TRAIN|VAL|TEST}.parquet
+    where SOURCE is "CUSTOM" or "OTPW"
+
+Usage:
+    # Load CUSTOM data (default)
+    loader = FlightDelayDataLoader()
+    
+    # Load OTPW data
+    loader = FlightDelayDataLoader(source="OTPW")
+    
+    # Load OTPW data with graph features
+    loader = FlightDelayDataLoader(source="OTPW", suffix="_with_graph")
 
 Fold Strategies:
 - "non_overlapping" (default): Uses pre-saved non-overlapping rolling window folds
@@ -39,19 +50,22 @@ TOTAL_FOLDS = 4
 
 
 # -----------------------------
-# DATA LOADER (CUSTOM ONLY)
+# DATA LOADER (CUSTOM OR OTPW)
 # -----------------------------
 class FlightDelayDataLoader:
-    def __init__(self, suffix: str = ""):
+    def __init__(self, suffix: str = "", source: str = None):
         """
         Initialize the data loader.
         
         Args:
             suffix: Optional suffix to append to version (e.g., "_with_graph", "_with_graph_and_metamodels")
                     Default: "" (base folds with only flight lineage features)
+            source: Source dataset to load ("CUSTOM" or "OTPW"). 
+                    Default: None (uses global SOURCE variable for backwards compatibility)
         """
         self.folds = {}
         self.suffix = suffix
+        self.source = source if source is not None else SOURCE  # Use provided source or fall back to global
         self.numerical_features = [
             'hourlyprecipitation',
             'hourlysealevelpressure',
@@ -68,10 +82,6 @@ class FlightDelayDataLoader:
             'distance',
             'elevation',
             
-            # Meta Models
-            'predicted_prev_flight_total_duration_XGB_1', # NEW!
-            'predicted_prev_flight_air_time_XGB_1', # Coming Soon!
-            'predicted_prev_flight_turnover_time_XGB_1', # Coming Soon!
             # Flight lineage features
             'lineage_rank',
             'prev_flight_dep_delay',
@@ -105,7 +115,38 @@ class FlightDelayDataLoader:
             'required_time_prev_flight_minutes',
             'safe_required_time_prev_flight_minutes',
             'safe_impossible_on_time_flag',
+            # Rolling average delay features (data leakage-free)
+            'tail_num_rolling_avg_delay_24h',
+            'tail_num_rolling_avg_delay_7d',
+            'tail_num_rolling_avg_delay_30d',
+            'origin_rolling_avg_delay_24h',
+            'origin_rolling_avg_delay_7d',
+            'origin_rolling_avg_delay_30d',
         ]
+        
+        # Dynamically add graph features if suffix contains "_with_graph"
+        if "_with_graph" in suffix:
+            graph_features = [
+                'origin_pagerank_weighted',
+                'origin_pagerank_unweighted',
+                'dest_pagerank_weighted',
+                'dest_pagerank_unweighted',
+                # Previous flight graph features (may or may not exist depending on lineage)
+                'prev_flight_origin_pagerank_weighted',
+                'prev_flight_origin_pagerank_unweighted',
+                'prev_flight_dest_pagerank_weighted',
+                'prev_flight_dest_pagerank_unweighted',
+            ]
+            self.numerical_features.extend(graph_features)
+        
+        # Dynamically add meta-model prediction features if suffix contains "_with_graph_and_metamodels"
+        if "_with_graph_and_metamodels" in suffix:
+            meta_model_features = [
+                'predicted_prev_flight_air_time_XGB_1',
+                'predicted_prev_flight_turnover_time_XGB_1',
+                'predicted_prev_flight_total_duration_XGB_1',
+            ]
+            self.numerical_features.extend(meta_model_features)
 
     def _cast_numerics(self, df):
         """Safely cast all configured numeric columns to doubles."""
@@ -139,15 +180,16 @@ class FlightDelayDataLoader:
         folds = []
         for fold_idx in range(1, TOTAL_FOLDS + 1):
             # Include suffix in filename if provided
-            train_name = f"OTPW_{SOURCE}_{version}{self.suffix}_FOLD_{fold_idx}_TRAIN"
+            # Use self.source (which may be provided or fall back to global SOURCE)
+            train_name = f"OTPW_{self.source}_{version}{self.suffix}_FOLD_{fold_idx}_TRAIN"
             train_df = self._load_parquet(train_name)
 
             if fold_idx < TOTAL_FOLDS:
-                val_name = f"OTPW_{SOURCE}_{version}{self.suffix}_FOLD_{fold_idx}_VAL"
+                val_name = f"OTPW_{self.source}_{version}{self.suffix}_FOLD_{fold_idx}_VAL"
                 val_df = self._load_parquet(val_name)
                 folds.append((train_df, val_df))
             else:
-                test_name = f"OTPW_{SOURCE}_{version}{self.suffix}_FOLD_{fold_idx}_TEST"
+                test_name = f"OTPW_{self.source}_{version}{self.suffix}_FOLD_{fold_idx}_TEST"
                 test_df = self._load_parquet(test_name)
                 folds.append((train_df, test_df))
 
@@ -169,6 +211,41 @@ class FlightDelayDataLoader:
 
     def get_version(self, version):
         return self.folds[version]
+    
+    def get_valid_numerical_features(self, df, sample_size=10000):
+        """
+        Get numerical features that exist in the DataFrame and have at least some non-null values.
+        This is useful for filtering out all-NULL columns before passing to Imputer.
+        
+        Args:
+            df: Spark DataFrame to check
+            sample_size: Number of rows to sample for checking (default: 10000)
+                        Use None to check all rows (slower but more accurate)
+        
+        Returns:
+            list: List of numerical feature names that are valid (exist and have non-null values)
+        """
+        valid_features = []
+        
+        # Sample DataFrame if specified (for performance)
+        check_df = df if sample_size is None else df.limit(sample_size)
+        
+        # Check each numerical feature
+        for col_name in self.numerical_features:
+            if col_name not in df.columns:
+                # Column doesn't exist - skip it
+                continue
+            
+            # Check if column has any non-null values
+            non_null_count = check_df.filter(F.col(col_name).isNotNull()).count()
+            
+            if non_null_count > 0:
+                valid_features.append(col_name)
+            else:
+                # All values are NULL - skip it
+                print(f"⚠ Skipping '{col_name}' - all values are NULL")
+        
+        return valid_features
 
 
 # -----------------------------
@@ -346,7 +423,8 @@ class FlightDelayCV:
             # ADDED_BY_SID_START
             # CRITICAL: Clean up after EVERY fold
             print(f"Cleaning up fold {i}...")
-            spark = SparkSession.builder.getOrCreate() 
+            # Get SparkSession for cache clearing
+            spark = SparkSession.builder.getOrCreate()
             spark.catalog.clearCache()
             
             try:

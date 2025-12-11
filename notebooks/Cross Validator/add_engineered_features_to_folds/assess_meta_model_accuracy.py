@@ -21,7 +21,7 @@ from datetime import datetime
 # CONFIGURATION
 # -------------------------
 # List of versions to assess (e.g., ["3M", "12M", "60M"])
-VERSIONS = ["3M","12M","60M"]  # <-- EDIT THIS LIST
+VERSIONS = ["60M"]  # <-- EDIT THIS LIST
 
 INPUT_SUFFIX = "_with_graph_and_metamodels"  # Suffix for folds with meta-model predictions
 
@@ -31,7 +31,7 @@ META_MODEL_IDS = ["XGB_1"]  # <-- EDIT THIS LIST
 # Target columns and their corresponding prediction columns
 TARGETS = {
     "prev_flight_air_time": "predicted_prev_flight_air_time_XGB_1",
-    "prev_flight_taxi_time": "predicted_prev_flight_taxi_time_XGB_1",
+    "prev_flight_taxi_time": "predicted_prev_flight_turnover_time_XGB_1",  # Note: renamed to turnover_time
     "prev_flight_total_duration": "predicted_prev_flight_total_duration_XGB_1"
 }
 

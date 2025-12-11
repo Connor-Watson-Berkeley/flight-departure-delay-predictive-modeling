@@ -22,19 +22,29 @@ import importlib.util
 column_mapping_path = "/Workspace/Shared/Team 4_2/flight-departure-delay-predictive-modeling/notebooks/Cross Validator/OTPW integration/column_mapping.py"
 try:
     spec = importlib.util.spec_from_file_location("column_mapping", column_mapping_path)
-except:
+    if spec is None:
+        raise FileNotFoundError(f"Could not load spec from {column_mapping_path}")
+except Exception as e:
     # Fallback to relative path for local development
     script_dir = os.path.dirname(os.path.abspath(__file__))
     column_mapping_path = os.path.join(script_dir, "column_mapping.py")
     spec = importlib.util.spec_from_file_location("column_mapping", column_mapping_path)
+    if spec is None:
+        raise FileNotFoundError(f"Could not load spec from {column_mapping_path}")
 
-column_mapping = importlib.util.module_from_spec(spec)
-sys.modules["column_mapping"] = column_mapping
-spec.loader.exec_module(column_mapping)
-
-# Import functions from the loaded module
-map_otpw_columns_to_custom = column_mapping.map_otpw_columns_to_custom
-validate_mapping = column_mapping.validate_mapping
+try:
+    column_mapping = importlib.util.module_from_spec(spec)
+    sys.modules["column_mapping"] = column_mapping
+    spec.loader.exec_module(column_mapping)
+    
+    # Import functions from the loaded module
+    map_otpw_columns_to_custom = column_mapping.map_otpw_columns_to_custom
+    validate_mapping = column_mapping.validate_mapping
+except Exception as e:
+    print(f"ERROR loading column_mapping module: {e}")
+    import traceback
+    traceback.print_exc()
+    raise
 
 # Configuration
 FOLDER_PATH = "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed"
@@ -74,14 +84,25 @@ def test_mapping():
             print(f"   Will attempt to find alternative or create from available columns")
     except Exception as e:
         print(f"   ✗ ERROR loading OTPW data: {e}")
+        import traceback
+        traceback.print_exc()
         return False
     
     # Step 2: Apply mapping
     print(f"\n2. Applying column mapping...")
     try:
         df_mapped = map_otpw_columns_to_custom(df_otpw)
+        # Force schema evaluation to ensure all columns are visible
+        _ = df_mapped.schema
         print(f"   ✓ Mapping applied: {df_mapped.count():,} rows, {len(df_mapped.columns)} columns")
         print(f"   Sample mapped columns: {sorted(df_mapped.columns)[:10]}")
+        # Debug: Check for DEP_DELAY and dep_delay specifically
+        all_cols = set(df_mapped.columns)
+        print(f"   Debug: DEP_DELAY in columns: {'DEP_DELAY' in all_cols}")
+        print(f"   Debug: dep_delay in columns: {'dep_delay' in all_cols}")
+        if 'DEP_DELAY' in all_cols or 'dep_delay' in all_cols:
+            dep_delay_cols = [c for c in all_cols if 'dep' in c.lower() and 'delay' in c.lower()]
+            print(f"   Debug: All dep_delay variants: {sorted(dep_delay_cols)}")
     except Exception as e:
         print(f"   ✗ ERROR applying mapping: {e}")
         import traceback
@@ -147,6 +168,9 @@ def test_mapping():
                 missing.append(col)
     
     # Special validation: Check that both DEP_DELAY (uppercase) and dep_delay (lowercase) exist
+    # Force schema evaluation to ensure all columns are visible
+    _ = df_mapped.schema
+    
     print(f"\n   Special validation: DEP_DELAY case handling...")
     has_upper = "DEP_DELAY" in df_mapped.columns
     has_lower = "dep_delay" in df_mapped.columns
@@ -159,16 +183,26 @@ def test_mapping():
     elif has_upper and not has_lower:
         print(f"   ❌ 'DEP_DELAY' (uppercase) exists but 'dep_delay' (lowercase) is MISSING!")
         print(f"   ⚠ flight_lineage_features.py requires 'dep_delay' (lowercase)")
-        missing.append("dep_delay")
+        # Only add if not already in missing list (to avoid duplicates)
+        if "dep_delay" not in missing:
+            missing.append("dep_delay")
     elif not has_upper and has_lower:
         print(f"   ❌ 'dep_delay' (lowercase) exists but 'DEP_DELAY' (uppercase) is MISSING!")
         print(f"   ⚠ cv.py requires 'DEP_DELAY' (uppercase)")
-        missing.append("DEP_DELAY")
+        # Only add if not already in missing list (to avoid duplicates)
+        if "DEP_DELAY" not in missing:
+            missing.append("DEP_DELAY")
     else:
         print(f"   ❌ Both 'DEP_DELAY' (uppercase) and 'dep_delay' (lowercase) are MISSING!")
-        missing.extend(["DEP_DELAY", "dep_delay"])
+        # Only add if not already in missing list (to avoid duplicates)
+        if "DEP_DELAY" not in missing:
+            missing.append("DEP_DELAY")
+        if "dep_delay" not in missing:
+            missing.append("dep_delay")
     
     if missing:
+        # Remove duplicates from missing list
+        missing = list(set(missing))
         print(f"\n   ❌ CRITICAL ERROR: {len(missing)} critical column(s) missing: {missing}")
         print(f"   These columns are REQUIRED by flight_lineage_features.py or other feature engineering scripts!")
         return False

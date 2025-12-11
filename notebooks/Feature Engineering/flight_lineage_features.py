@@ -87,6 +87,17 @@ def add_flight_lineage_features(df):
     # Step 1: Identify tail_num column
     tail_num_col = _find_tail_num_column(df)
     
+    # Step 1.5: Determine dep_delay column name (handle both DEP_DELAY and dep_delay)
+    # Standardize on DEP_DELAY (uppercase) to match cv.py, but be flexible for backwards compatibility
+    dep_delay_col = None
+    if "DEP_DELAY" in df.columns:
+        dep_delay_col = "DEP_DELAY"
+    elif "dep_delay" in df.columns:
+        dep_delay_col = "dep_delay"
+    else:
+        raise ValueError("Neither 'DEP_DELAY' nor 'dep_delay' column found in DataFrame. Required for flight lineage features.")
+    print(f"✓ Using departure delay column: '{dep_delay_col}'")
+    
     # Step 2: Prepare arrival timestamp for ranking
     print("\nStep 2: Creating arrival timestamp for ranking...")
     df = df.withColumn(
@@ -114,7 +125,7 @@ def add_flight_lineage_features(df):
     
     # Step 4: Get Previous Flight Data Using LAG
     print("\nStep 4: Getting previous flight data using LAG...")
-    df = _add_previous_flight_data(df, window_spec)
+    df = _add_previous_flight_data(df, window_spec, dep_delay_col)
     print("✓ Previous flight data retrieved")
     
     # Step 5: Convert crs_dep_time to minutes
@@ -133,7 +144,7 @@ def add_flight_lineage_features(df):
     
     # Step 7: Compute Expected Flight Time and Cumulative Features
     print("\nStep 7: Computing expected flight time and cumulative features...")
-    df = _compute_cumulative_features(df, tail_num_col)
+    df = _compute_cumulative_features(df, tail_num_col, dep_delay_col)
     print("✓ Cumulative features computed")
     
     # Step 7.5: Compute Rotation Time (Previous Departure to Current Scheduled Departure)
@@ -166,6 +177,11 @@ def add_flight_lineage_features(df):
     df = _compute_required_time_features(df)
     print("✓ Required time features computed")
     
+    # Step 9.7: Compute Rolling Average Delay Features
+    print("\nStep 9.7: Computing rolling average delay features (24hr, 7-day, 30-day)...")
+    df = _compute_rolling_average_delays(df, tail_num_col, dep_delay_col)
+    print("✓ Rolling average delay features computed")
+    
     # Step 10: Apply Imputation for NULL Values (First Flight Handling)
     print("\nStep 10: Applying imputation for NULL values (first flight handling)...")
     df = _apply_imputation(df)
@@ -178,8 +194,16 @@ def add_flight_lineage_features(df):
     print("\n" + "=" * 60)
     print("✓ FLIGHT LINEAGE JOIN COMPLETE")
     print("=" * 60)
-    print(f"\nNew columns added: ~42+ lineage features")
+    print(f"\nNew columns added: ~54+ lineage features (including rolling averages)")
     print(f"\n📊 DATA LEAKAGE-FREE FEATURES (Safe for Training):")
+    print(f"  Rolling Average Delay Features:")
+    print(f"    - tail_num_rolling_avg_delay_24h: 24-hour rolling average delay per tail number")
+    print(f"    - tail_num_rolling_avg_delay_7d: 7-day rolling average delay per tail number")
+    print(f"    - tail_num_rolling_avg_delay_30d: 30-day rolling average delay per tail number")
+    print(f"    - origin_rolling_avg_delay_24h: 24-hour rolling average delay per origin airport")
+    print(f"    - origin_rolling_avg_delay_7d: 7-day rolling average delay per origin airport")
+    print(f"    - origin_rolling_avg_delay_30d: 30-day rolling average delay per origin airport")
+    print(f"      (All rolling averages only include flights that departed >= 2 hours before current flight's scheduled departure)")
     print(f"  Rotation Time Features:")
     print(f"    - safe_lineage_rotation_time_minutes: Safe rotation time (handles data leakage)")
     print(f"    - scheduled_lineage_rotation_time_minutes: Scheduled rotation time (prev_crs_dep → curr_crs_dep)")
@@ -235,14 +259,14 @@ def _find_tail_num_column(df):
         raise ValueError(f"Could not find tail_num column. Available columns: {df.columns[:20]}...")
 
 
-def _add_previous_flight_data(df, window_spec):
+def _add_previous_flight_data(df, window_spec, dep_delay_col):
     """Add previous flight data using LAG window function."""
     # Core Previous Flight Information
     df = df.withColumn('prev_flight_origin', F.lag('origin', 1).over(window_spec))
     df = df.withColumn('prev_flight_dest', F.lag('dest', 1).over(window_spec))
     df = df.withColumn('prev_flight_actual_dep_time', F.lag('dep_time', 1).over(window_spec))
     df = df.withColumn('prev_flight_actual_arr_time', F.lag('arr_time', 1).over(window_spec))
-    df = df.withColumn('prev_flight_dep_delay', F.lag('dep_delay', 1).over(window_spec))
+    df = df.withColumn('prev_flight_dep_delay', F.lag(dep_delay_col, 1).over(window_spec))
     df = df.withColumn('prev_flight_arr_delay', F.lag('arr_delay', 1).over(window_spec))
     df = df.withColumn('prev_flight_air_time', F.lag('air_time', 1).over(window_spec))
     
@@ -380,7 +404,7 @@ def _compute_turnover_time(df):
     return df
 
 
-def _compute_cumulative_features(df, tail_num_col):
+def _compute_cumulative_features(df, tail_num_col, dep_delay_col):
     """Compute cumulative delay features."""
     df = df.withColumn(
         'crs_arr_time_minutes',
@@ -461,11 +485,12 @@ def _compute_cumulative_features(df, tail_num_col):
     # Cumulative features: Look at flights BEFORE the immediate previous flight (exclude flight n-1)
     # This reduces data leakage risk since we're not using the immediate previous flight's delay
     # Use -2 instead of -1 to exclude the immediate previous flight
+    # Handle dep_delay column - use same column as determined above (DEP_DELAY or dep_delay)
     window_spec_cumulative = Window.partitionBy(tail_num_col).orderBy(F.col('arrival_timestamp').asc_nulls_last()).rowsBetween(Window.unboundedPreceding, -2)
-    df = df.withColumn('lineage_cumulative_delay', F.sum('dep_delay').over(window_spec_cumulative))
+    df = df.withColumn('lineage_cumulative_delay', F.sum(dep_delay_col).over(window_spec_cumulative))
     df = df.withColumn('lineage_num_previous_flights', F.count('*').over(window_spec_cumulative))
-    df = df.withColumn('lineage_avg_delay_previous_flights', F.avg('dep_delay').over(window_spec_cumulative))
-    df = df.withColumn('lineage_max_delay_previous_flights', F.max('dep_delay').over(window_spec_cumulative))
+    df = df.withColumn('lineage_avg_delay_previous_flights', F.avg(dep_delay_col).over(window_spec_cumulative))
+    df = df.withColumn('lineage_max_delay_previous_flights', F.max(dep_delay_col).over(window_spec_cumulative))
     
     return df
 
@@ -821,6 +846,192 @@ def _compute_required_time_features(df):
         'safe_impossible_on_time_flag',
         col('safe_required_time_prev_flight_minutes') > col('safe_lineage_rotation_time_minutes')
     )
+    
+    return df
+
+
+def _compute_rolling_average_delays(df, tail_num_col, dep_delay_col):
+    """
+    Compute rolling average delay features per tail number and per airport.
+    
+    Features computed:
+    - 24-hour rolling average departure delay per tail number
+    - 7-day rolling average departure delay per tail number
+    - 30-day rolling average departure delay per tail number
+    - 24-hour rolling average departure delay per origin airport
+    - 7-day rolling average departure delay per origin airport
+    - 30-day rolling average departure delay per origin airport
+    
+    Data leakage prevention:
+    - Only includes flights where actual_dep_time <= prediction_cutoff_timestamp
+    - prediction_cutoff_timestamp = scheduled_departure_time - 2 hours
+    - This ensures we only use information available 2 hours before the current flight's scheduled departure
+    
+    Parameters:
+    -----------
+    df : pyspark.sql.DataFrame
+        DataFrame with flight data, must have:
+        - prediction_cutoff_timestamp (from _check_data_leakage)
+        - dep_time, fl_date, crs_dep_time, origin, dest
+        - dep_delay_col (DEP_DELAY or dep_delay)
+    
+    Returns:
+    --------
+    pyspark.sql.DataFrame
+        DataFrame with rolling average delay features added
+    """
+    # Step 1: Create actual departure timestamp for all flights
+    # This is needed to filter flights that departed before the prediction cutoff
+    df = df.withColumn(
+        'actual_dep_timestamp',
+        F.when(
+            (col('dep_time').isNotNull()) & (col('fl_date').isNotNull()),
+            F.to_timestamp(
+                F.concat(col('fl_date'), F.lpad(col('dep_time').cast('string'), 4, '0')),
+                'yyyy-MM-ddHHmm'
+            )
+        ).otherwise(None)
+    )
+    
+    # Step 2: Create scheduled departure timestamp if not already present
+    if 'sched_depart_date_time' not in df.columns:
+        df = df.withColumn(
+            'sched_depart_date_time',
+            F.when(
+                col('fl_date').isNotNull() & col('crs_dep_time').isNotNull(),
+                F.to_timestamp(
+                    F.concat(col('fl_date'), F.lpad(col('crs_dep_time').cast('string'), 4, '0')),
+                    'yyyy-MM-ddHHmm'
+                )
+            ).otherwise(None)
+        )
+    
+    # Ensure prediction_cutoff_timestamp exists (should be created in _check_data_leakage)
+    if 'prediction_cutoff_timestamp' not in df.columns:
+        df = df.withColumn(
+            'prediction_cutoff_timestamp',
+            F.when(
+                col('sched_depart_date_time').isNotNull(),
+                F.expr("sched_depart_date_time - INTERVAL 2 HOURS")
+            ).otherwise(None)
+        )
+    
+    # Step 3: Create a timestamp for window ordering (use actual if available, otherwise scheduled)
+    df = df.withColumn(
+        'dep_timestamp_for_window',
+        F.coalesce(col('actual_dep_timestamp'), col('sched_depart_date_time'))
+    )
+    
+    # Step 4: Compute rolling averages using self-join for accurate data leakage prevention
+    # 
+    # CRITICAL DATA LEAKAGE PREVENTION:
+    # We need to compare: previous_row.actual_dep_timestamp <= current_row.prediction_cutoff_timestamp
+    # This ensures we only use flights that actually departed at least 2 hours before
+    # the current flight's scheduled departure.
+    #
+    # Window functions can't directly reference the current row's value when filtering previous rows,
+    # so we use a self-join approach for accuracy.
+    #
+    # Strategy: For each current flight, we join to all previous flights (same tail_num or origin)
+    # where the previous flight's actual_dep_timestamp <= current flight's prediction_cutoff_timestamp
+    # and within the time window (24h, 7d, 30d).
+    
+    # Add a row ID for joining
+    df = df.withColumn('_row_id', F.monotonically_increasing_id())
+    
+    # Create aliases for self-join
+    current = df.alias('current')
+    previous = df.alias('previous')
+    
+    # Helper function to compute rolling average via self-join
+    def compute_rolling_avg_via_join(partition_col, window_seconds, feature_name):
+        """Compute rolling average using self-join for accurate data leakage prevention."""
+        # Join condition: same partition (tail_num or origin) and time constraints
+        join_condition = (
+            (F.col('current.' + partition_col) == F.col('previous.' + partition_col)) &
+            # Data leakage prevention: previous flight must have actually departed
+            # before current flight's prediction cutoff (2 hours before scheduled departure)
+            (F.col('previous.actual_dep_timestamp').isNotNull()) &
+            (F.col('current.prediction_cutoff_timestamp').isNotNull()) &
+            (F.col('previous.actual_dep_timestamp') <= F.col('current.prediction_cutoff_timestamp')) &
+            # Time window: within the specified window size
+            (F.unix_timestamp(F.col('current.prediction_cutoff_timestamp')) - 
+             F.unix_timestamp(F.col('previous.actual_dep_timestamp')) <= window_seconds) &
+            (F.unix_timestamp(F.col('current.prediction_cutoff_timestamp')) - 
+             F.unix_timestamp(F.col('previous.actual_dep_timestamp')) >= 0) &
+            # Only include previous flights (not the current flight itself)
+            (F.col('current._row_id') != F.col('previous._row_id')) &
+            # Only include flights with valid delay data
+            (F.col('previous.' + dep_delay_col).isNotNull())
+        )
+        
+        # Aggregate: compute average delay for matching previous flights
+        rolling_avg = previous.join(
+            current,
+            join_condition,
+            'right'
+        ).groupBy(
+            F.col('current._row_id').alias('_row_id')
+        ).agg(
+            F.avg(F.col('previous.' + dep_delay_col)).alias(feature_name)
+        )
+        
+        return rolling_avg
+    
+    # Compute all rolling averages in separate aggregations, then join them all at once
+    print("  Computing rolling averages per tail number...")
+    tail_24h = compute_rolling_avg_via_join(tail_num_col, 86400, 'tail_num_rolling_avg_delay_24h')
+    tail_7d = compute_rolling_avg_via_join(tail_num_col, 604800, 'tail_num_rolling_avg_delay_7d')
+    tail_30d = compute_rolling_avg_via_join(tail_num_col, 2592000, 'tail_num_rolling_avg_delay_30d')
+    
+    print("  Computing rolling averages per origin airport...")
+    origin_24h = compute_rolling_avg_via_join('origin', 86400, 'origin_rolling_avg_delay_24h')
+    origin_7d = compute_rolling_avg_via_join('origin', 604800, 'origin_rolling_avg_delay_7d')
+    origin_30d = compute_rolling_avg_via_join('origin', 2592000, 'origin_rolling_avg_delay_30d')
+    
+    # The aggregated results already have _row_id aliased correctly from groupBy
+    # Join all rolling averages back to the main dataframe using qualified column names
+    # Use explicit aliases and drop the duplicate _row_id from the right side after each join
+    
+    # Join each rolling average feature one at a time
+    df = df.alias('df_main').join(
+        tail_24h.alias('tail_24h'),
+        F.col('df_main._row_id') == F.col('tail_24h._row_id'),
+        'left'
+    ).drop(F.col('tail_24h._row_id'))
+    
+    df = df.alias('df_main').join(
+        tail_7d.alias('tail_7d'),
+        F.col('df_main._row_id') == F.col('tail_7d._row_id'),
+        'left'
+    ).drop(F.col('tail_7d._row_id'))
+    
+    df = df.alias('df_main').join(
+        tail_30d.alias('tail_30d'),
+        F.col('df_main._row_id') == F.col('tail_30d._row_id'),
+        'left'
+    ).drop(F.col('tail_30d._row_id'))
+    
+    df = df.alias('df_main').join(
+        origin_24h.alias('origin_24h'),
+        F.col('df_main._row_id') == F.col('origin_24h._row_id'),
+        'left'
+    ).drop(F.col('origin_24h._row_id'))
+    
+    df = df.alias('df_main').join(
+        origin_7d.alias('origin_7d'),
+        F.col('df_main._row_id') == F.col('origin_7d._row_id'),
+        'left'
+    ).drop(F.col('origin_7d._row_id'))
+    
+    df = df.alias('df_main').join(
+        origin_30d.alias('origin_30d'),
+        F.col('df_main._row_id') == F.col('origin_30d._row_id'),
+        'left'
+    ).drop(F.col('origin_30d._row_id'))
+    
+    # Clean up temporary columns
+    df = df.drop('actual_dep_timestamp', 'dep_timestamp_for_window', '_row_id')
     
     return df
 

@@ -26,11 +26,14 @@ VERSIONS = ["12M"]  # <-- EDIT THIS LIST
 
 INPUT_FOLDER = "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed"
 OUTPUT_FOLDER = "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed"
-SOURCE = "CUSTOM"
+SOURCE = "OTPW"  # Change to "CUSTOM" for CUSTOM data, "OTPW" for OTPW data
 WRITE_MODE = "overwrite"
 VERBOSE = True
 OUTPUT_SUFFIX = "_with_graph"
 INPUT_SUFFIX = ""  # Input suffix (default: '' for base folds)
+SKIP_EXISTING_FOLDS = True  # If True, skip folds where all graph features already exist 
+                             # AND have >97% non-null values (catches bugs where columns were created but not populated).
+                             # If any are missing or have too many NULLs, the fold will be re-processed to add/fix the missing features.
 
 
 # -------------------------
@@ -243,6 +246,125 @@ def compute_pagerank_features(train_df, val_df,
 # -------------------------
 # HELPER FUNCTIONS
 # -------------------------
+def fold_exists(version: str, fold_idx: int, output_suffix: str, fold_type: str):
+    """
+    Check if a fold already exists in the output folder AND has all expected graph features.
+    
+    Args:
+        version: Data version (e.g., "12M")
+        fold_idx: Fold index (1-4)
+        output_suffix: Output suffix (e.g., "_with_graph")
+        fold_type: "VAL" or "TEST"
+    
+    Returns:
+        True if fold exists AND has all expected graph feature columns with >97% non-null values, False otherwise
+    """
+    from pyspark.sql import SparkSession
+    from pyspark.sql.functions import col
+    spark = SparkSession.builder.getOrCreate()
+    
+    base_name = f"OTPW_{SOURCE}_{version}{output_suffix}"
+    train_name = f"{base_name}_FOLD_{fold_idx}_TRAIN"
+    train_path = f"{OUTPUT_FOLDER}/{train_name}.parquet"
+    
+    if fold_type == "VAL":
+        val_name = f"{base_name}_FOLD_{fold_idx}_VAL"
+        val_path = f"{OUTPUT_FOLDER}/{val_name}.parquet"
+    else:
+        test_name = f"{base_name}_FOLD_{fold_idx}_TEST"
+        val_path = f"{OUTPUT_FOLDER}/{test_name}.parquet"
+    
+    # Check if both train and val/test files exist
+    # Use Spark's file system to check existence (faster than trying to read)
+    try:
+        hadoop_conf = spark.sparkContext._jsc.hadoopConfiguration()
+        fs = spark.sparkContext._jvm.org.apache.hadoop.fs.FileSystem.get(
+            spark.sparkContext._jvm.java.net.URI(train_path), hadoop_conf
+        )
+        train_exists = fs.exists(spark.sparkContext._jvm.org.apache.hadoop.fs.Path(train_path))
+        val_exists = fs.exists(spark.sparkContext._jvm.org.apache.hadoop.fs.Path(val_path))
+        
+        if not (train_exists and val_exists):
+            return False
+        
+        # Read DataFrames to check columns and non-null percentages
+        try:
+            train_df = spark.read.option("mergeSchema", "true").parquet(train_path)
+            val_df = spark.read.option("mergeSchema", "true").parquet(val_path)
+            train_cols = set(train_df.columns)
+            val_cols = set(val_df.columns)
+            
+            # Expected graph feature columns (always present)
+            expected_cols = [
+                "origin_pagerank_weighted",
+                "origin_pagerank_unweighted",
+                "dest_pagerank_weighted",
+                "dest_pagerank_unweighted"
+            ]
+            
+            # Optional: prev_flight graph features (if prev_flight columns exist)
+            if "prev_flight_origin" in train_cols and "prev_flight_origin" in val_cols:
+                expected_cols.extend([
+                    "prev_flight_origin_pagerank_weighted",
+                    "prev_flight_origin_pagerank_unweighted"
+                ])
+            
+            if "prev_flight_dest" in train_cols and "prev_flight_dest" in val_cols:
+                expected_cols.extend([
+                    "prev_flight_dest_pagerank_weighted",
+                    "prev_flight_dest_pagerank_unweighted"
+                ])
+            
+            # Check if all expected columns exist in both train and val
+            missing_cols_train = [col for col in expected_cols if col not in train_cols]
+            missing_cols_val = [col for col in expected_cols if col not in val_cols]
+            
+            if missing_cols_train or missing_cols_val:
+                # Fold exists but is incomplete - return False so it gets reprocessed
+                return False
+            
+            # Check non-null percentage for each column (must be >97% non-null)
+            # This catches bugs where columns were created but not populated
+            MIN_NON_NULL_PERCENTAGE = 0.97  # 97% threshold
+            
+            train_total = train_df.count()
+            val_total = val_df.count()
+            
+            # Check each expected column
+            for col_name in expected_cols:
+                # Check train DataFrame
+                train_non_null = train_df.filter(col(col_name).isNotNull()).count()
+                train_non_null_pct = train_non_null / train_total if train_total > 0 else 0.0
+                
+                if train_non_null_pct < MIN_NON_NULL_PERCENTAGE:
+                    # Column exists but has too many NULLs - fold needs reprocessing
+                    return False
+                
+                # Check val/test DataFrame
+                val_non_null = val_df.filter(col(col_name).isNotNull()).count()
+                val_non_null_pct = val_non_null / val_total if val_total > 0 else 0.0
+                
+                if val_non_null_pct < MIN_NON_NULL_PERCENTAGE:
+                    # Column exists but has too many NULLs - fold needs reprocessing
+                    return False
+            
+            # All columns exist and have >97% non-null values
+            return True
+        except Exception:
+            # If we can't read or check the data, assume incomplete
+            return False
+    except Exception as e:
+        # Fallback: try to read schema (slower but more reliable)
+        try:
+            train_df = spark.read.option("mergeSchema", "true").parquet(train_path)
+            val_df = spark.read.option("mergeSchema", "true").parquet(val_path)
+            _ = train_df.schema
+            _ = val_df.schema
+            return True
+        except:
+            return False
+
+
 def load_cv_module():
     """Load the cv module using importlib (for Databricks compatibility)."""
     cv_path = "/Workspace/Shared/Team 4_2/flight-departure-delay-predictive-modeling/notebooks/Cross Validator/cv.py"
@@ -339,6 +461,11 @@ def add_graph_features_to_folds(version: str, input_suffix: str = ""):
     print(f"{'='*80}")
     print(f"Input suffix: {input_suffix or '(none - base folds)'}")
     print(f"Output suffix: {OUTPUT_SUFFIX}")
+    if SKIP_EXISTING_FOLDS:
+        print(f"  ✓ Resume mode: ENABLED (will skip completed folds)")
+    else:
+        print(f"  ⚠ Resume mode: DISABLED (will re-run all folds)")
+        print(f"  💡 Tip: Set SKIP_EXISTING_FOLDS=True for overnight runs to auto-resume after failures")
     
     # Load all available folds (same pattern as cv.py dataloader)
     folds = load_folds_for_version(version, input_suffix)
@@ -350,10 +477,26 @@ def add_graph_features_to_folds(version: str, input_suffix: str = ""):
     
     print(f"  Found {len(folds)} folds")
     
+    if SKIP_EXISTING_FOLDS:
+        print(f"  ⏭ Skip existing folds: ENABLED (will skip folds that already exist with valid graph features)")
+    else:
+        print(f"  ⏭ Skip existing folds: DISABLED (will re-run all folds)")
+    
+    processed_count = 0
+    skipped_count = 0
+    
     for fold_idx, (train_df, val_or_test_df, fold_type) in enumerate(folds, start=1):
         print(f"\n{'='*60}")
         print(f"Processing Fold {fold_idx}/{len(folds)} ({fold_type})")
         print(f"{'='*60}")
+        
+        # Check if fold already exists (resume mode)
+        if SKIP_EXISTING_FOLDS and fold_exists(version, fold_idx, OUTPUT_SUFFIX, fold_type):
+            if VERBOSE:
+                print(f"  ⏭ Skipping fold {fold_idx} (already exists with all expected graph features)")
+            print(f"✅ Fold {fold_idx} skipped (already complete)")
+            skipped_count += 1
+            continue
         
         if VERBOSE:
             train_count = train_df.count()
@@ -372,10 +515,15 @@ def add_graph_features_to_folds(version: str, input_suffix: str = ""):
         save_fold_with_suffix(version, fold_idx, train_with_graph, val_or_test_with_graph, 
                              OUTPUT_SUFFIX, fold_type)
         
-        print(f"✅ Fold {fold_idx} complete")
+        print(f"✅ Fold {fold_idx} complete (saved - safe to interrupt)")
+        processed_count += 1
     
     print(f"\n{'='*80}")
-    print(f"✅ Complete! All folds saved with suffix: {OUTPUT_SUFFIX}")
+    print(f"✅ Complete! All folds processed")
+    print(f"   Processed: {processed_count} folds")
+    if SKIP_EXISTING_FOLDS:
+        print(f"   Skipped: {skipped_count} folds (already existed)")
+    print(f"   Output suffix: {OUTPUT_SUFFIX}")
     print(f"   Use version='{version}' with suffix='{OUTPUT_SUFFIX}' in cv.py")
     print(f"{'='*80}")
 

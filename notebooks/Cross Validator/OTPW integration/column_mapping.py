@@ -366,6 +366,8 @@ def map_otpw_columns_to_custom(df: DataFrame, verbose: bool = True) -> DataFrame
         >>> df_custom = map_otpw_columns_to_custom(df_otpw)
         >>> # Now df_custom has columns matching CUSTOM schema
     """
+    # Store original columns for reference
+    original_columns = set(df.columns)
     result_df = df
     
     # Step 1: Rename columns according to mapping
@@ -437,9 +439,153 @@ def map_otpw_columns_to_custom(df: DataFrame, verbose: bool = True) -> DataFrame
                 result_df = result_df.withColumn(custom_col, F.lit(default_value))
             print(f"✓ Added missing CUSTOM column '{custom_col}' with default value: {default_value}")
     
-    # Step 3b: Handle DEP_DELAY - ensure both UPPERCASE and lowercase versions exist
-    # flight_lineage_features.py uses lowercase 'dep_delay' but cv.py expects UPPERCASE 'DEP_DELAY'
-    # We need BOTH columns to exist as actual duplicates (not aliases) so they persist through parquet
+    # Step 3a: Derive missing critical columns if possible
+    # Handle fl_date: Try multiple methods to derive the flight date
+    if "fl_date" not in result_df.columns:
+        if verbose:
+            print(f"  ⚠ 'fl_date' missing - attempting to derive...")
+        
+        found_date_col = None
+        
+        # Method 1: Check for alternative date column names
+        date_col_candidates = ["DATE", "date", "FL_DATE", "flight_date", "FlightDate"]
+        for candidate in date_col_candidates:
+            if candidate in result_df.columns:
+                found_date_col = candidate
+                if verbose:
+                    print(f"    Found date column: '{candidate}' - converting to 'fl_date'")
+                # Convert to date type
+                result_df = result_df.withColumn("fl_date", F.to_date(F.col(candidate)))
+                break
+        
+        # Method 2: Extract date from scheduled departure datetime columns
+        if found_date_col is None:
+            datetime_col_candidates = [
+                "sched_depart_date_time",
+                "sched_depart_date_time_utc",
+                "sched_depart_date_time_UTC",
+                "SCHED_DEPART_DATE_TIME",
+                "scheduled_departure_datetime",
+                "departure_datetime"
+            ]
+            for candidate in datetime_col_candidates:
+                if candidate in result_df.columns:
+                    found_date_col = candidate
+                    if verbose:
+                        print(f"    Found scheduled departure datetime: '{candidate}' - extracting date to 'fl_date'")
+                    # Extract date from datetime (handles both timestamp and string formats)
+                    result_df = result_df.withColumn("fl_date", F.to_date(F.col(candidate)))
+                    if verbose:
+                        print(f"    ✓ Extracted 'fl_date' from scheduled departure datetime")
+                    break
+        
+        # Method 3: Construct from year/month/day_of_month components
+        if found_date_col is None:
+            # Check for year column (check both lowercase and uppercase, and also check original columns)
+            has_year = "year" in result_df.columns or "YEAR" in result_df.columns
+            # Also check original columns in case year exists but wasn't mapped yet
+            if not has_year:
+                has_year = "year" in original_columns or "YEAR" in original_columns or any("year" in col.lower() for col in original_columns)
+                if has_year:
+                    # Find the year column name
+                    year_col_candidates = [col for col in original_columns if "year" in col.lower()]
+                    if year_col_candidates:
+                        year_col_orig = year_col_candidates[0]
+                        if verbose:
+                            print(f"    Found year column in original data: '{year_col_orig}'")
+                        # Map it if needed - check if it was already mapped to lowercase
+                        if "year" not in result_df.columns and year_col_orig not in result_df.columns:
+                            # Need to check if it exists in result_df with different case
+                            result_df_cols_lower = {c.lower(): c for c in result_df.columns}
+                            if "year" in result_df_cols_lower:
+                                # Already exists with different case
+                                has_year = True
+                            else:
+                                # Add it
+                                result_df = result_df.withColumn("year", F.col(year_col_orig))
+                                has_year = True
+                        else:
+                            has_year = True
+            
+            has_month = "month" in result_df.columns or "MONTH" in result_df.columns
+            has_day = "day_of_month" in result_df.columns or "DAY_OF_MONTH" in result_df.columns
+            
+            if has_month and has_day:
+                if has_year:
+                    if verbose:
+                        print(f"    Constructing 'fl_date' from year/month/day_of_month...")
+                    year_col = "year" if "year" in result_df.columns else "YEAR"
+                    month_col = "month" if "month" in result_df.columns else "MONTH"
+                    day_col = "day_of_month" if "day_of_month" in result_df.columns else "DAY_OF_MONTH"
+                    
+                    # Construct date string and convert to date
+                    result_df = result_df.withColumn(
+                        "fl_date",
+                        F.to_date(
+                            F.concat(
+                                F.col(year_col).cast("string"),
+                                F.lit("-"),
+                                F.lpad(F.col(month_col).cast("string"), 2, "0"),
+                                F.lit("-"),
+                                F.lpad(F.col(day_col).cast("string"), 2, "0")
+                            ),
+                            "yyyy-MM-dd"
+                        )
+                    )
+                    if verbose:
+                        print(f"    ✓ Constructed 'fl_date' from {year_col}/{month_col}/{day_col}")
+                else:
+                    # Year is missing but we have month/day - use default year 2015 for 60M data
+                    # This is a fallback since 60M should be 2015-2019
+                    if verbose:
+                        print(f"    ⚠ Year column missing - using default year 2015 (60M data should be 2015-2019)")
+                        print(f"    ⚠ WARNING: This assumes all flights are in 2015. Verify data if dates look incorrect.")
+                    month_col = "month" if "month" in result_df.columns else "MONTH"
+                    day_col = "day_of_month" if "day_of_month" in result_df.columns else "DAY_OF_MONTH"
+                    
+                    # Construct date with default year 2015
+                    result_df = result_df.withColumn(
+                        "fl_date",
+                        F.to_date(
+                            F.concat(
+                                F.lit("2015-"),
+                                F.lpad(F.col(month_col).cast("string"), 2, "0"),
+                                F.lit("-"),
+                                F.lpad(F.col(day_col).cast("string"), 2, "0")
+                            ),
+                            "yyyy-MM-dd"
+                        )
+                    )
+                    if verbose:
+                        print(f"    ✓ Constructed 'fl_date' from {month_col}/{day_col} with default year 2015")
+            else:
+                if verbose:
+                    print(f"    ❌ Cannot derive 'fl_date': missing date components")
+                    print(f"      Has year: {has_year}, Has month: {has_month}, Has day: {has_day}")
+                    print(f"      Available columns: {sorted(result_df.columns)[:30]}...")
+    
+    # Handle op_carrier: Derive from op_unique_carrier if available
+    if "op_carrier" not in result_df.columns:
+        if "op_unique_carrier" in result_df.columns:
+            if verbose:
+                print(f"  ⚠ 'op_carrier' missing - deriving from 'op_unique_carrier'...")
+            result_df = result_df.withColumn("op_carrier", F.col("op_unique_carrier"))
+            if verbose:
+                print(f"    ✓ Created 'op_carrier' from 'op_unique_carrier'")
+        elif "OP_UNIQUE_CARRIER" in result_df.columns:
+            if verbose:
+                print(f"  ⚠ 'op_carrier' missing - deriving from 'OP_UNIQUE_CARRIER'...")
+            result_df = result_df.withColumn("op_carrier", F.col("OP_UNIQUE_CARRIER"))
+            if verbose:
+                print(f"    ✓ Created 'op_carrier' from 'OP_UNIQUE_CARRIER'")
+        else:
+            if verbose:
+                print(f"  ⚠ 'op_carrier' missing and cannot derive from op_unique_carrier")
+    
+    # Step 3b: Handle DEP_DELAY - ensure UPPERCASE version exists
+    # NOTE: We only create DEP_DELAY here. The lowercase 'dep_delay' will be added
+    # after saving/loading in process_otpw_data.py to avoid Spark ambiguity issues.
+    # This breaks the logical plan chain and ensures clean column creation.
     
     # Check what we have after all mappings and case conversions
     current_cols = set(result_df.columns)
@@ -448,8 +594,11 @@ def map_otpw_columns_to_custom(df: DataFrame, verbose: bool = True) -> DataFrame
     
     if verbose:
         print(f"  Debug: After case conversion - has_upper={has_upper}, has_lower={has_lower}")
+        if has_lower and not has_upper:
+            print(f"  Note: 'dep_delay' exists but 'DEP_DELAY' is missing - will create DEP_DELAY")
     
-    # Simple approach: ensure both exist
+    # Simple approach: ensure DEP_DELAY (uppercase) exists
+    # The lowercase version will be added later in process_otpw_data.py after save/load
     if not has_upper and not has_lower:
         # Neither exists - check for alternatives
         possible_dep_delay_cols = [
@@ -465,11 +614,10 @@ def map_otpw_columns_to_custom(df: DataFrame, verbose: bool = True) -> DataFrame
                 found_alt = alt_col
                 if verbose:
                     print(f"⚠ Found alternative departure delay column: '{alt_col}'")
-                # Create both versions from the alternative
-                result_df = result_df.withColumn("dep_delay", F.col(alt_col) * 1.0)
+                # Create only DEP_DELAY (uppercase) - dep_delay will be added later
                 result_df = result_df.withColumn("DEP_DELAY", F.col(alt_col) * 1.0)
                 if verbose:
-                    print(f"  Created both 'dep_delay' and 'DEP_DELAY' from '{alt_col}'")
+                    print(f"  Created 'DEP_DELAY' from '{alt_col}' (dep_delay will be added after save/load)")
                 break
         
         if found_alt is None:
@@ -483,52 +631,101 @@ def map_otpw_columns_to_custom(df: DataFrame, verbose: bool = True) -> DataFrame
                 f"Please check OTPW data or update COLUMN_MAPPING in column_mapping.py"
             )
     else:
-        # At least one exists - ensure both exist
-        if has_upper and not has_lower:
-            # We have uppercase, create lowercase duplicate
-            result_df = result_df.withColumn("dep_delay", F.col("DEP_DELAY") * 1.0)
-            if verbose:
-                print("✓ Created 'dep_delay' (lowercase) from 'DEP_DELAY' (uppercase) - required by flight_lineage_features.py")
-        elif has_lower and not has_upper:
-            # We have lowercase, create uppercase duplicate
+        # At least one exists - ensure DEP_DELAY (uppercase) exists
+        # The lowercase version will be added later in process_otpw_data.py after save/load
+        if has_lower and not has_upper:
+            # We have lowercase, create uppercase version
             result_df = result_df.withColumn("DEP_DELAY", F.col("dep_delay") * 1.0)
             if verbose:
                 print("✓ Created 'DEP_DELAY' (uppercase) from 'dep_delay' (lowercase) - required by cv.py")
-        else:
-            # Both exist - perfect!
+                print("  Note: 'dep_delay' will be re-added after save/load to avoid ambiguity")
+        elif has_upper and not has_lower:
+            # We have uppercase - perfect! dep_delay will be added later
+            # CRITICAL: Ensure DEP_DELAY stays uppercase - drop any lowercase version that might exist
+            if "dep_delay" in result_df.columns:
+                result_df = result_df.drop("dep_delay")
+                if verbose:
+                    print("  Dropped 'dep_delay' to avoid ambiguity (will be re-added after save/load)")
             if verbose:
-                print("✓ Both 'DEP_DELAY' (uppercase) and 'dep_delay' (lowercase) already exist")
+                print("✓ 'DEP_DELAY' (uppercase) exists - 'dep_delay' will be added after save/load")
+        else:
+            # Both exist - drop dep_delay and keep only DEP_DELAY to avoid ambiguity
+            if verbose:
+                print("✓ Both 'DEP_DELAY' and 'dep_delay' exist - dropping 'dep_delay' (will be re-added after save/load)")
+            result_df = result_df.drop("dep_delay")
+    
+    # Force schema evaluation to ensure DEP_DELAY is visible
+    _ = result_df.schema
+    
+    # Verify DEP_DELAY exists (we don't need dep_delay here - it will be added later)
+    cols_after_creation = set(result_df.columns)
+    has_upper_after = "DEP_DELAY" in cols_after_creation
+    
+    if verbose:
+        print(f"  Debug: After mapping - DEP_DELAY: {has_upper_after}")
+    
+    if not has_upper_after:
+        # Last resort: try to create from dep_delay if it exists
+        if "dep_delay" in cols_after_creation:
+            result_df = result_df.withColumn("DEP_DELAY", F.col("dep_delay") * 1.0)
+            if verbose:
+                print("  ⚠ Created DEP_DELAY from dep_delay as fallback")
+            _ = result_df.schema
     
     # Step 4: Validate that critical columns exist
     # Force schema evaluation to ensure all columns are materialized (including newly created ones)
-    _ = result_df.schema  # Force schema evaluation
+    # This is critical - we need to force evaluation after creating columns
+    schema = result_df.schema
+    _ = schema  # Force schema evaluation
     
-    # Get final column list after all transformations
-    final_cols = set(result_df.columns)
+    # Get final column list after all transformations - force evaluation
+    final_cols_list = list(result_df.columns)
+    final_cols = set(final_cols_list)
     
-    # Verify both DEP_DELAY and dep_delay exist (they should after Step 3b)
-    if "DEP_DELAY" not in final_cols or "dep_delay" not in final_cols:
-        # This shouldn't happen, but if it does, try to fix it
-        if "DEP_DELAY" not in final_cols and "dep_delay" in final_cols:
+    # Double-check DEP_DELAY exists after schema evaluation
+    # Note: We don't check for dep_delay here - it will be added after save/load in process_otpw_data.py
+    # Sometimes Spark's lazy evaluation means columns aren't visible until schema is evaluated
+    if "DEP_DELAY" not in final_cols:
+        # Re-check after forcing schema evaluation
+        final_cols_list = list(result_df.columns)
+        final_cols = set(final_cols_list)
+        
+        # If still missing, try to create from dep_delay if it exists
+        if "dep_delay" in final_cols:
             result_df = result_df.withColumn("DEP_DELAY", F.col("dep_delay") * 1.0)
-            final_cols.add("DEP_DELAY")
             if verbose:
                 print("⚠ Fixed: Created 'DEP_DELAY' from 'dep_delay' during validation")
-        elif "dep_delay" not in final_cols and "DEP_DELAY" in final_cols:
-            result_df = result_df.withColumn("dep_delay", F.col("DEP_DELAY") * 1.0)
-            final_cols.add("dep_delay")
-            if verbose:
-                print("⚠ Fixed: Created 'dep_delay' from 'DEP_DELAY' during validation")
-        # Re-evaluate after potential fix
-        final_cols = set(result_df.columns)
+            # Force final schema evaluation to ensure column is visible
+            _ = result_df.schema
+            final_cols = set(result_df.columns)
     
     critical_columns = [
         "fl_date",  # Date column (lowercase)
         "DEP_DELAY",  # Main label (UPPERCASE - matches cv.py FlightDelayEvaluator)
+        # Note: dep_delay (lowercase) will be added after save/load in process_otpw_data.py
         "origin",  # Required for joins and features (lowercase)
         "dest",  # Required for joins and features (lowercase)
         "op_carrier",  # Required for joins and features (lowercase)
     ]
+    
+    # Force one more schema evaluation and column check before validation
+    # CRITICAL: Check schema fields directly to avoid lazy evaluation issues
+    schema_fields = {f.name for f in result_df.schema.fields}
+    final_cols = set(result_df.columns)
+    
+    # Ensure DEP_DELAY exists - check both columns list and schema fields
+    if "DEP_DELAY" not in final_cols and "DEP_DELAY" not in schema_fields:
+        # Try to create from dep_delay if it exists
+        if "dep_delay" in final_cols or "dep_delay" in schema_fields:
+            if verbose:
+                print(f"⚠ DEP_DELAY missing in final check, creating from dep_delay...")
+            result_df = result_df.withColumn("DEP_DELAY", F.col("dep_delay") * 1.0)
+            _ = result_df.schema
+            final_cols = set(result_df.columns)
+        else:
+            # DEP_DELAY is truly missing - this is an error
+            if verbose:
+                print(f"❌ ERROR: DEP_DELAY is missing and dep_delay is not available to create it from")
     
     missing_critical = [col for col in critical_columns if col not in final_cols]
     
@@ -547,6 +744,40 @@ def map_otpw_columns_to_custom(df: DataFrame, verbose: bool = True) -> DataFrame
             f"Please update COLUMN_MAPPING in column_mapping.py. "
             f"Available columns: {sorted(final_cols)[:30]}"
         )
+    
+    # Final verification: Ensure DEP_DELAY exists in the schema before returning
+    # Note: dep_delay will be added after save/load in process_otpw_data.py
+    # CRITICAL: Force schema evaluation and check both columns list and schema fields
+    _ = result_df.schema
+    final_cols_check = set(result_df.columns)
+    final_schema_cols = {f.name for f in result_df.schema.fields}
+    
+    # Check if DEP_DELAY exists in either place
+    has_dep_delay_in_cols = "DEP_DELAY" in final_cols_check
+    has_dep_delay_in_schema = "DEP_DELAY" in final_schema_cols
+    
+    if not has_dep_delay_in_cols and not has_dep_delay_in_schema:
+        # DEP_DELAY is truly missing - try to create from dep_delay as last resort
+        has_dep_delay_lower = "dep_delay" in final_cols_check or "dep_delay" in final_schema_cols
+        if has_dep_delay_lower:
+            if verbose:
+                print("⚠ CRITICAL: DEP_DELAY missing before return, creating from dep_delay...")
+            result_df = result_df.withColumn("DEP_DELAY", F.col("dep_delay") * 1.0)
+            _ = result_df.schema
+            # Verify it was created
+            final_check = set(result_df.columns)
+            if "DEP_DELAY" not in final_check:
+                raise ValueError("Failed to create DEP_DELAY from dep_delay. Cannot proceed.")
+            if verbose:
+                print("  ✓ DEP_DELAY created successfully")
+        else:
+            raise ValueError(
+                "Critical column 'DEP_DELAY' missing after mapping and 'dep_delay' not available. "
+                "Cannot proceed. Available delay columns: " + 
+                str([c for c in final_cols_check if "delay" in c.lower()])
+            )
+    elif verbose:
+        print(f"  ✓ Final check: DEP_DELAY exists (in cols: {has_dep_delay_in_cols}, in schema: {has_dep_delay_in_schema})")
     
     return result_df
 
