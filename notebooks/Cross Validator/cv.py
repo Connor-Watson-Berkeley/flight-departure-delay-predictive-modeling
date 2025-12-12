@@ -557,7 +557,7 @@ class FlightDelayCV:
         self.fit_results = m  # Store results for later retrieval
         return m
 
-    def evaluate(self, use_fold_3_val_train=False):
+    def evaluate(self, use_fold_3_val_train=False, skip_fitting=False):
         """
         Evaluate model on test set.
         
@@ -602,7 +602,10 @@ class FlightDelayCV:
                 if hasattr(stage, 'setFoldIndex'):
                     stage.setFoldIndex(fold_index)
 
-        self.test_model = self.estimator.fit(train_df)
+        if skip_fitting:
+            self.test_model = self.models[-1]
+        else:
+            self.test_model = self.estimator.fit(train_df)
         
         # Evaluate on training set
         train_preds = self.test_model.transform(train_df)

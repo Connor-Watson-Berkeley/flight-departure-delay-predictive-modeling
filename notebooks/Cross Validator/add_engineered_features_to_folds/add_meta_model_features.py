@@ -33,7 +33,7 @@ VERSIONS = ["3M","60M","12M"]  # <-- EDIT THIS LIST
 
 INPUT_FOLDER = "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed"
 OUTPUT_FOLDER = "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed"
-SOURCE = "CUSTOM"
+SOURCE = "OTPW"  # Change to "CUSTOM" for CUSTOM data, "OTPW" for OTPW data
 WRITE_MODE = "overwrite"
 VERBOSE = True
 OUTPUT_SUFFIX = "_with_graph_and_metamodels"
@@ -121,8 +121,8 @@ def load_folds_for_version(version: str, input_suffix: str = ""):
     """
     cv = load_cv_module()
     
-    # Create data loader with suffix
-    data_loader = cv.FlightDelayDataLoader(suffix=input_suffix)
+    # Create data loader with suffix and source (use local SOURCE, not cv.py's global)
+    data_loader = cv.FlightDelayDataLoader(suffix=input_suffix, source=SOURCE)
     
     # Temporarily patch _load_parquet to use mergeSchema for schema evolution
     original_load_parquet = data_loader._load_parquet
@@ -426,9 +426,75 @@ def compute_meta_model_predictions(train_df, val_df, model_id="RF_1", verbose=Tr
             if verbose:
                 print(f"  ⚠ Derived prev_flight_taxi_time from prev_flight_taxi_in + prev_flight_taxi_out (fallback)")
     
-    # Derive prev_flight_total_duration from prev_flight_actual_elapsed_time if needed
+    # Derive prev_flight_total_duration from actual rotation time (current actual dep - prev actual dep)
+    # This is the total time from previous flight's actual departure to current flight's actual departure
+    # Rotation time = Air Time + Turnover Time (aviation terminology)
     if "prev_flight_total_duration" not in train_with_meta.columns:
-        if "prev_flight_actual_elapsed_time" in train_with_meta.columns:
+        # First, ensure we have the time components in minutes
+        from pyspark.sql.functions import when, floor, lit
+        
+        # Compute actual_dep_time_minutes if not already present
+        if "actual_dep_time_minutes" not in train_with_meta.columns:
+            train_with_meta = train_with_meta.withColumn(
+                "actual_dep_time_minutes",
+                when(
+                    col("dep_time").isNotNull(),
+                    floor(col("dep_time") / 100) * 60 + (col("dep_time") % 100)
+                ).otherwise(None)
+            )
+            val_with_meta = val_with_meta.withColumn(
+                "actual_dep_time_minutes",
+                when(
+                    col("dep_time").isNotNull(),
+                    floor(col("dep_time") / 100) * 60 + (col("dep_time") % 100)
+                ).otherwise(None)
+            )
+        
+        # Compute prev_flight_actual_dep_time_minutes if not already present
+        if "prev_flight_actual_dep_time_minutes" not in train_with_meta.columns:
+            if "prev_flight_actual_dep_time" in train_with_meta.columns:
+                train_with_meta = train_with_meta.withColumn(
+                    "prev_flight_actual_dep_time_minutes",
+                    when(
+                        col("prev_flight_actual_dep_time").isNotNull(),
+                        floor(col("prev_flight_actual_dep_time") / 100) * 60 + (col("prev_flight_actual_dep_time") % 100)
+                    ).otherwise(None)
+                )
+                val_with_meta = val_with_meta.withColumn(
+                    "prev_flight_actual_dep_time_minutes",
+                    when(
+                        col("prev_flight_actual_dep_time").isNotNull(),
+                        floor(col("prev_flight_actual_dep_time") / 100) * 60 + (col("prev_flight_actual_dep_time") % 100)
+                    ).otherwise(None)
+                )
+        
+        # Compute actual rotation time = current actual dep - previous actual dep
+        # This is the total duration from previous departure to current departure
+        if "actual_dep_time_minutes" in train_with_meta.columns and "prev_flight_actual_dep_time_minutes" in train_with_meta.columns:
+            train_with_meta = train_with_meta.withColumn(
+                "prev_flight_total_duration",
+                when(
+                    (col("actual_dep_time_minutes").isNotNull()) & (col("prev_flight_actual_dep_time_minutes").isNotNull()),
+                    when(
+                        col("actual_dep_time_minutes") >= col("prev_flight_actual_dep_time_minutes"),
+                        col("actual_dep_time_minutes") - col("prev_flight_actual_dep_time_minutes")
+                    ).otherwise(col("actual_dep_time_minutes") + 1440 - col("prev_flight_actual_dep_time_minutes"))
+                ).otherwise(None)
+            )
+            val_with_meta = val_with_meta.withColumn(
+                "prev_flight_total_duration",
+                when(
+                    (col("actual_dep_time_minutes").isNotNull()) & (col("prev_flight_actual_dep_time_minutes").isNotNull()),
+                    when(
+                        col("actual_dep_time_minutes") >= col("prev_flight_actual_dep_time_minutes"),
+                        col("actual_dep_time_minutes") - col("prev_flight_actual_dep_time_minutes")
+                    ).otherwise(col("actual_dep_time_minutes") + 1440 - col("prev_flight_actual_dep_time_minutes"))
+                ).otherwise(None)
+            )
+            if verbose:
+                print(f"  ✓ Derived prev_flight_total_duration from actual rotation time (current actual dep - prev actual dep)")
+        elif "prev_flight_actual_elapsed_time" in train_with_meta.columns:
+            # Fallback to previous flight's elapsed time if rotation time components not available
             train_with_meta = train_with_meta.withColumn(
                 "prev_flight_total_duration", col("prev_flight_actual_elapsed_time")
             )
@@ -436,7 +502,7 @@ def compute_meta_model_predictions(train_df, val_df, model_id="RF_1", verbose=Tr
                 "prev_flight_total_duration", col("prev_flight_actual_elapsed_time")
             )
             if verbose:
-                print(f"  ✓ Derived prev_flight_total_duration from prev_flight_actual_elapsed_time")
+                print(f"  ⚠ Derived prev_flight_total_duration from prev_flight_actual_elapsed_time (fallback - not ideal)")
     else:
         if verbose:
             print(f"  🔍✓ Using existing prev_flight_total_duration column")
@@ -446,6 +512,46 @@ def compute_meta_model_predictions(train_df, val_df, model_id="RF_1", verbose=Tr
     
     if verbose:
         print(f"  Shared features: {len(categorical_features)} categorical, {len(numerical_features)} numerical")
+    
+    # CRITICAL: Cast numerical features to numeric types before preprocessing
+    # Some features (especially weather features) may be loaded as strings, but Imputer requires numeric types
+    NULL_PAT = r'^(NA|N/A|NULL|null|None|none|\\N|\\s*|\\.|M|T)$'
+    
+    # Get current column types
+    train_dtypes = dict(train_with_meta.dtypes)
+    val_dtypes = dict(val_with_meta.dtypes)
+    
+    features_to_cast = []
+    for col_name in numerical_features:
+        if col_name in train_with_meta.columns:
+            current_type = train_dtypes[col_name]
+            # Check if column is string type (needs casting)
+            if current_type in ['string', 'StringType']:
+                features_to_cast.append(col_name)
+    
+    if features_to_cast:
+        if verbose:
+            print(f"  Casting {len(features_to_cast)} numerical features from string to double:")
+            for col_name in features_to_cast[:5]:  # Show first 5
+                print(f"    - {col_name}")
+            if len(features_to_cast) > 5:
+                print(f"    ... and {len(features_to_cast) - 5} more")
+        
+        # Cast all string numerical features to double
+        for col_name in features_to_cast:
+            # Cast to double, handling NULL patterns
+            train_with_meta = train_with_meta.withColumn(
+                col_name,
+                F.regexp_replace(F.col(col_name).cast("string"), NULL_PAT, "")
+                .cast("double")
+            )
+            val_with_meta = val_with_meta.withColumn(
+                col_name,
+                F.regexp_replace(F.col(col_name).cast("string"), NULL_PAT, "")
+                .cast("double")
+            )
+    
+    if verbose:
         print(f"  Building shared preprocessing pipeline...")
     
     # Add stable row identifiers BEFORE preprocessing (for joining predictions back)
@@ -533,9 +639,13 @@ def compute_meta_model_predictions(train_df, val_df, model_id="RF_1", verbose=Tr
                     if has_crs:
                         print(f"      ⚠ BUG: Derivation should have created prev_flight_air_time but didn't!")
                 elif target == "prev_flight_total_duration":
-                    has_actual = "prev_flight_actual_elapsed_time" in train_with_meta.columns
-                    print(f"      ⚠ Missing in original - prev_flight_actual_elapsed_time exists: {has_actual}")
-                    if has_actual:
+                    has_actual_dep = "actual_dep_time_minutes" in train_with_meta.columns
+                    has_prev_actual_dep = "prev_flight_actual_dep_time_minutes" in train_with_meta.columns
+                    has_actual_elapsed = "prev_flight_actual_elapsed_time" in train_with_meta.columns
+                    print(f"      ⚠ Missing in original - actual_dep_time_minutes exists: {has_actual_dep}")
+                    print(f"      ⚠ Missing in original - prev_flight_actual_dep_time_minutes exists: {has_prev_actual_dep}")
+                    print(f"      ⚠ Missing in original - prev_flight_actual_elapsed_time exists: {has_actual_elapsed}")
+                    if (has_actual_dep and has_prev_actual_dep) or has_actual_elapsed:
                         print(f"      ⚠ BUG: Derivation should have created prev_flight_total_duration but didn't!")
             elif in_original and not in_preprocessed:
                 print(f"      ⚠ CRITICAL ERROR: Column exists in original but missing after preprocessing!")

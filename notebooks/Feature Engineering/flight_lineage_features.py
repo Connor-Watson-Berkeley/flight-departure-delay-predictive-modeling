@@ -162,6 +162,25 @@ def add_flight_lineage_features(df):
     )
     print("✓ Jump detection complete")
     
+    # Step 8.5: Ensure sched_depart_date_time exists (needed for data leakage check)
+    # Handle both CUSTOM (sched_depart_date_time) and OTPW (sched_depart_date_time_utc)
+    if 'sched_depart_date_time' not in df.columns:
+        if 'sched_depart_date_time_utc' in df.columns:
+            # Use UTC version from OTPW
+            df = df.withColumn('sched_depart_date_time', col('sched_depart_date_time_utc'))
+        else:
+            # Create from fl_date and crs_dep_time
+            df = df.withColumn(
+                'sched_depart_date_time',
+                F.when(
+                    col('fl_date').isNotNull() & col('crs_dep_time').isNotNull(),
+                    F.to_timestamp(
+                        F.concat(col('fl_date'), F.lpad(col('crs_dep_time').cast('string'), 4, '0')),
+                        'yyyy-MM-ddHHmm'
+                    )
+                ).otherwise(None)
+            )
+    
     # Step 9: Check Data Leakage for All Risky Columns
     print("\nStep 9: Checking data leakage for all risky columns...")
     df = _check_data_leakage(df)
@@ -347,10 +366,31 @@ def _add_previous_flight_data(df, window_spec, dep_delay_col):
     
     if existing_weather_cols:
         print(f"  ✓ Lagging {len(existing_weather_cols)} weather columns as previous flight features...")
+        # Pattern for NULL values that should be treated as NULL
+        NULL_PAT = r'^(NA|N/A|NULL|null|None|none|\\N|\\s*|\\.|M|T)$'
+        
         for weather_col in existing_weather_cols:
             prev_col_name = f'prev_flight_{weather_col}'
-            df = df.withColumn(prev_col_name, F.lag(weather_col, 1).over(window_spec))
-        print(f"    Created {len(existing_weather_cols)} prev_flight_* weather features")
+            # Lag the column first
+            lagged_col = F.lag(weather_col, 1).over(window_spec)
+            
+            # Check if the original column is numeric or string
+            # If it's a string, cast to double (handling NULL patterns)
+            # If it's already numeric, keep as-is but ensure it's double
+            original_type = dict(df.dtypes)[weather_col]
+            
+            if original_type in ['string', 'StringType']:
+                # Cast string to double, handling NULL patterns
+                df = df.withColumn(
+                    prev_col_name,
+                    F.regexp_replace(lagged_col.cast("string"), NULL_PAT, "")
+                    .cast("double")
+                )
+            else:
+                # Already numeric, but ensure it's double type
+                df = df.withColumn(prev_col_name, lagged_col.cast("double"))
+        
+        print(f"    Created {len(existing_weather_cols)} prev_flight_* weather features (cast to double)")
     else:
         print(f"  ⚠ No weather columns found - previous flight weather features will not be available")
         print(f"    This is expected if weather data is not joined")
@@ -485,9 +525,14 @@ def _compute_cumulative_features(df, tail_num_col, dep_delay_col):
     # Cumulative features: Look at flights BEFORE the immediate previous flight (exclude flight n-1)
     # This reduces data leakage risk since we're not using the immediate previous flight's delay
     # Use -2 instead of -1 to exclude the immediate previous flight
+<<<<<<< Updated upstream
+    window_spec_cumulative = Window.partitionBy(tail_num_col).orderBy(F.col('arrival_timestamp').asc_nulls_last()).rowsBetween(Window.unboundedPreceding, -2)
+    df = df.withColumn('lineage_cumulative_delay', F.sum('dep_delay').over(window_spec_cumulative))
+=======
     # Handle dep_delay column - use same column as determined above (DEP_DELAY or dep_delay)
     window_spec_cumulative = Window.partitionBy(tail_num_col).orderBy(F.col('arrival_timestamp').asc_nulls_last()).rowsBetween(Window.unboundedPreceding, -2)
     df = df.withColumn('lineage_cumulative_delay', F.sum(dep_delay_col).over(window_spec_cumulative))
+>>>>>>> Stashed changes
     df = df.withColumn('lineage_num_previous_flights', F.count('*').over(window_spec_cumulative))
     df = df.withColumn('lineage_avg_delay_previous_flights', F.avg(dep_delay_col).over(window_spec_cumulative))
     df = df.withColumn('lineage_max_delay_previous_flights', F.max(dep_delay_col).over(window_spec_cumulative))
@@ -573,10 +618,15 @@ def _compute_safe_features(df):
             col('sched_depart_date_time')
         ).otherwise(
             F.when(
-                col('fl_date').isNotNull() & col('crs_dep_time').isNotNull(),
-                F.to_timestamp(
-                    F.concat(col('fl_date'), F.lpad(col('crs_dep_time').cast('string'), 4, '0')),
-                    'yyyy-MM-ddHHmm'
+                col('sched_depart_date_time_utc').isNotNull(),
+                col('sched_depart_date_time_utc')
+            ).otherwise(
+                F.when(
+                    col('fl_date').isNotNull() & col('crs_dep_time').isNotNull(),
+                    F.to_timestamp(
+                        F.concat(col('fl_date'), F.lpad(col('crs_dep_time').cast('string'), 4, '0')),
+                        'yyyy-MM-ddHHmm'
+                    )
                 )
             )
         )
@@ -894,17 +944,27 @@ def _compute_rolling_average_delays(df, tail_num_col, dep_delay_col):
     )
     
     # Step 2: Create scheduled departure timestamp if not already present
+    # Handle both CUSTOM (sched_depart_date_time) and OTPW (sched_depart_date_time_utc)
     if 'sched_depart_date_time' not in df.columns:
-        df = df.withColumn(
-            'sched_depart_date_time',
-            F.when(
-                col('fl_date').isNotNull() & col('crs_dep_time').isNotNull(),
-                F.to_timestamp(
-                    F.concat(col('fl_date'), F.lpad(col('crs_dep_time').cast('string'), 4, '0')),
-                    'yyyy-MM-ddHHmm'
-                )
-            ).otherwise(None)
-        )
+        # Check if OTPW version exists
+        if 'sched_depart_date_time_utc' in df.columns:
+            # Use UTC version from OTPW
+            df = df.withColumn(
+                'sched_depart_date_time',
+                col('sched_depart_date_time_utc')
+            )
+        else:
+            # Create from fl_date and crs_dep_time
+            df = df.withColumn(
+                'sched_depart_date_time',
+                F.when(
+                    col('fl_date').isNotNull() & col('crs_dep_time').isNotNull(),
+                    F.to_timestamp(
+                        F.concat(col('fl_date'), F.lpad(col('crs_dep_time').cast('string'), 4, '0')),
+                        'yyyy-MM-ddHHmm'
+                    )
+                ).otherwise(None)
+            )
     
     # Ensure prediction_cutoff_timestamp exists (should be created in _check_data_leakage)
     if 'prediction_cutoff_timestamp' not in df.columns:
@@ -936,8 +996,16 @@ def _compute_rolling_average_delays(df, tail_num_col, dep_delay_col):
     # where the previous flight's actual_dep_timestamp <= current flight's prediction_cutoff_timestamp
     # and within the time window (24h, 7d, 30d).
     
-    # Add a row ID for joining
-    df = df.withColumn('_row_id', F.monotonically_increasing_id())
+    # Add a deterministic row ID for joining
+    # Use row_number() with a stable ordering to ensure determinism across shuffles
+    # Order by prediction_cutoff_timestamp (or scheduled departure) and other stable columns
+    row_id_window = Window.orderBy(
+        F.col('prediction_cutoff_timestamp').asc_nulls_last(),
+        F.col('fl_date').asc_nulls_last(),
+        F.col('crs_dep_time').asc_nulls_last(),
+        F.col(tail_num_col).asc_nulls_last()
+    )
+    df = df.withColumn('_row_id', F.row_number().over(row_id_window))
     
     # Create aliases for self-join
     current = df.alias('current')

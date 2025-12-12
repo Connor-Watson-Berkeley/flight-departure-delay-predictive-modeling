@@ -397,8 +397,8 @@ def load_folds_for_version(version: str, input_suffix: str = ""):
     cv.VERSIONS = [version]
     
     try:
-        # Create a loader instance with the input suffix
-        data_loader = cv.FlightDelayDataLoader(suffix=input_suffix)
+        # Create a loader instance with the input suffix and source (use local SOURCE, not cv.py's global)
+        data_loader = cv.FlightDelayDataLoader(suffix=input_suffix, source=SOURCE)
         
         # Load all versions (in this case, just the one we need)
         data_loader.load()
