@@ -39,7 +39,7 @@ SOURCE = "OTPW"  # Change to "OTPW" when processing OTPW data
 DATE_COL = "FL_DATE"  # Default/preference - auto-detects actual column (FL_DATE for CUSTOM, fl_date for OTPW)
 
 # List of versions to assess (e.g., ["3M", "12M", "60M"])
-VERSIONS = ["60M"]  # <-- EDIT THIS LIST
+VERSIONS = ["12M"]  # <-- EDIT THIS LIST
 
 # Dataset paths - depends on SOURCE
 # When SOURCE="CUSTOM": Uses Custom Join outputs
@@ -192,20 +192,42 @@ def create_sliding_window_folds(
 # SAVE FOLDS
 # -------------------------
 def save_folds_to_parquet(folds, version: str):
-    """Save folds in your loader's naming convention."""
+    """Save folds in your loader's naming convention with optimized partitioning."""
     n_total = len(folds)
     n_cv = n_total - 1  # last is test
 
-    for i, (train_df, val_df) in enumerate(folds, start=1):
-        train_name = f"OTPW_{SOURCE}_{version}_FOLD_{i}_TRAIN"
-        train_df.write.mode(WRITE_MODE).parquet(f"{OUTPUT_FOLDER}/{train_name}.parquet")
-
-        if i <= n_cv:
-            val_name = f"OTPW_{SOURCE}_{version}_FOLD_{i}_VAL"
-            val_df.write.mode(WRITE_MODE).parquet(f"{OUTPUT_FOLDER}/{val_name}.parquet")
+    def _get_optimal_partitions(row_count):
+        """Calculate optimal number of partitions for writing.
+        Target: ~100K-200K rows per partition for efficient writes."""
+        if row_count < 1_000_000:
+            return max(10, row_count // 100_000)  # Small datasets: ~100K rows/partition
+        elif row_count < 10_000_000:
+            return max(50, row_count // 150_000)  # Medium datasets: ~150K rows/partition
         else:
+            return max(200, min(500, row_count // 200_000))  # Large datasets: ~200K rows/partition, cap at 500
+
+    for i, (train_df, val_df) in enumerate(folds, start=1):
+        # Optimize train_df partitions
+        train_count = train_df.count()
+        train_partitions = _get_optimal_partitions(train_count)
+        print(f"  Writing Fold {i} TRAIN ({train_count:,} rows, {train_partitions} partitions)...")
+        train_name = f"OTPW_{SOURCE}_{version}_FOLD_{i}_TRAIN"
+        train_df.repartition(train_partitions).write.mode(WRITE_MODE).parquet(f"{OUTPUT_FOLDER}/{train_name}.parquet")
+        print(f"    ✓ Fold {i} TRAIN saved")
+
+        # Optimize val/test_df partitions
+        val_count = val_df.count()
+        val_partitions = _get_optimal_partitions(val_count)
+        if i <= n_cv:
+            print(f"  Writing Fold {i} VAL ({val_count:,} rows, {val_partitions} partitions)...")
+            val_name = f"OTPW_{SOURCE}_{version}_FOLD_{i}_VAL"
+            val_df.repartition(val_partitions).write.mode(WRITE_MODE).parquet(f"{OUTPUT_FOLDER}/{val_name}.parquet")
+            print(f"    ✓ Fold {i} VAL saved")
+        else:
+            print(f"  Writing Fold {i} TEST ({val_count:,} rows, {val_partitions} partitions)...")
             test_name = f"OTPW_{SOURCE}_{version}_FOLD_{i}_TEST"
-            val_df.write.mode(WRITE_MODE).parquet(f"{OUTPUT_FOLDER}/{test_name}.parquet")
+            val_df.repartition(val_partitions).write.mode(WRITE_MODE).parquet(f"{OUTPUT_FOLDER}/{test_name}.parquet")
+            print(f"    ✓ Fold {i} TEST saved")
 
 
 # -------------------------

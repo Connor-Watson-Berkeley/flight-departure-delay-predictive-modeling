@@ -22,7 +22,7 @@ import sys
 # CONFIGURATION
 # -------------------------
 # List of versions to process (e.g., ["3M", "12M", "60M", "XM"])
-VERSIONS = ["12M"]  # <-- EDIT THIS LIST
+VERSIONS = ["60M"]  # <-- EDIT THIS LIST
 
 INPUT_FOLDER = "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed"
 OUTPUT_FOLDER = "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed"

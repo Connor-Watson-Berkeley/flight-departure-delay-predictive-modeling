@@ -122,6 +122,36 @@ class FlightDelayDataLoader:
             'origin_rolling_avg_delay_24h',
             'origin_rolling_avg_delay_7d',
             'origin_rolling_avg_delay_30d',
+            
+            # Previous flight weather features (created by flight_lineage_features.py)
+            # These are only available if weather data is joined (e.g., OTPW dataset)
+            # Hourly weather features
+            'prev_flight_hourlyprecipitation',
+            'prev_flight_hourlywindspeed',
+            'prev_flight_hourlywinddirection',
+            'prev_flight_hourlyvisibility',
+            'prev_flight_hourlydrybulbtemperature',
+            'prev_flight_hourlydewpointtemperature',
+            'prev_flight_hourlyrelativehumidity',
+            'prev_flight_hourlysealevelpressure',
+            'prev_flight_hourlystationpressure',
+            'prev_flight_hourlyaltimetersetting',
+            'prev_flight_hourlywetbulbtemperature',
+            'prev_flight_hourlywindgustspeed',
+            'prev_flight_hourlypressurechange',
+            'prev_flight_hourlypressuretendency',
+            # Daily weather features
+            'prev_flight_dailyprecipitation',
+            'prev_flight_dailyaveragewindspeed',
+            'prev_flight_dailypeakwindspeed',
+            'prev_flight_dailymaximumdrybulbtemperature',
+            'prev_flight_dailyminimumdrybulbtemperature',
+            'prev_flight_dailyaveragedrybulbtemperature',
+            'prev_flight_dailysnowfall',
+            'prev_flight_dailysnowdepth',
+            # Monthly weather features
+            'prev_flight_monthlyaveragerh',
+            'prev_flight_monthlydeparturefromnormalaveragetemperature',
         ]
         
         # Dynamically add graph features if suffix contains "_with_graph"

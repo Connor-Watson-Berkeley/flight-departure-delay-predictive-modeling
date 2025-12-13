@@ -197,9 +197,11 @@ def add_flight_lineage_features(df):
     print("✓ Required time features computed")
     
     # Step 9.7: Compute Rolling Average Delay Features
-    print("\nStep 9.7: Computing rolling average delay features (24hr, 7-day, 30-day)...")
-    df = _compute_rolling_average_delays(df, tail_num_col, dep_delay_col)
-    print("✓ Rolling average delay features computed")
+    # REMOVED: Rolling averages are computationally expensive (self-joins on large datasets)
+    # Uncomment below to re-enable if needed:
+    # print("\nStep 9.7: Computing rolling average delay features (24hr, 7-day, 30-day)...")
+    # df = _compute_rolling_average_delays(df, tail_num_col, dep_delay_col)
+    # print("✓ Rolling average delay features computed")
     
     # Step 10: Apply Imputation for NULL Values (First Flight Handling)
     print("\nStep 10: Applying imputation for NULL values (first flight handling)...")
@@ -213,16 +215,8 @@ def add_flight_lineage_features(df):
     print("\n" + "=" * 60)
     print("✓ FLIGHT LINEAGE JOIN COMPLETE")
     print("=" * 60)
-    print(f"\nNew columns added: ~54+ lineage features (including rolling averages)")
+    print(f"\nNew columns added: ~42+ lineage features")
     print(f"\n📊 DATA LEAKAGE-FREE FEATURES (Safe for Training):")
-    print(f"  Rolling Average Delay Features:")
-    print(f"    - tail_num_rolling_avg_delay_24h: 24-hour rolling average delay per tail number")
-    print(f"    - tail_num_rolling_avg_delay_7d: 7-day rolling average delay per tail number")
-    print(f"    - tail_num_rolling_avg_delay_30d: 30-day rolling average delay per tail number")
-    print(f"    - origin_rolling_avg_delay_24h: 24-hour rolling average delay per origin airport")
-    print(f"    - origin_rolling_avg_delay_7d: 7-day rolling average delay per origin airport")
-    print(f"    - origin_rolling_avg_delay_30d: 30-day rolling average delay per origin airport")
-    print(f"      (All rolling averages only include flights that departed >= 2 hours before current flight's scheduled departure)")
     print(f"  Rotation Time Features:")
     print(f"    - safe_lineage_rotation_time_minutes: Safe rotation time (handles data leakage)")
     print(f"    - scheduled_lineage_rotation_time_minutes: Scheduled rotation time (prev_crs_dep → curr_crs_dep)")
@@ -332,8 +326,8 @@ def _add_previous_flight_data(df, window_spec, dep_delay_col):
         'hourlyaltimetersetting',
         'hourlywetbulbtemperature',
         'hourlywindgustspeed',
-        'hourlyskyconditions',
-        'hourlypresentweathertype',
+        # NOTE: hourlyskyconditions, hourlypresentweathertype, and dailyweather are CATEGORICAL
+        # and were incorrectly cast to numeric in previous versions. Removed to avoid confusion.
         'hourlypressurechange',
         'hourlypressuretendency',
         
@@ -346,7 +340,7 @@ def _add_previous_flight_data(df, window_spec, dep_delay_col):
         'dailyaveragedrybulbtemperature',
         'dailysnowfall',
         'dailysnowdepth',
-        'dailyweather',
+        # NOTE: dailyweather is CATEGORICAL - removed
         
         # Monthly Weather Variables (long-term patterns)
         'monthlyaveragerh',
@@ -525,14 +519,9 @@ def _compute_cumulative_features(df, tail_num_col, dep_delay_col):
     # Cumulative features: Look at flights BEFORE the immediate previous flight (exclude flight n-1)
     # This reduces data leakage risk since we're not using the immediate previous flight's delay
     # Use -2 instead of -1 to exclude the immediate previous flight
-<<<<<<< Updated upstream
-    window_spec_cumulative = Window.partitionBy(tail_num_col).orderBy(F.col('arrival_timestamp').asc_nulls_last()).rowsBetween(Window.unboundedPreceding, -2)
-    df = df.withColumn('lineage_cumulative_delay', F.sum('dep_delay').over(window_spec_cumulative))
-=======
     # Handle dep_delay column - use same column as determined above (DEP_DELAY or dep_delay)
     window_spec_cumulative = Window.partitionBy(tail_num_col).orderBy(F.col('arrival_timestamp').asc_nulls_last()).rowsBetween(Window.unboundedPreceding, -2)
     df = df.withColumn('lineage_cumulative_delay', F.sum(dep_delay_col).over(window_spec_cumulative))
->>>>>>> Stashed changes
     df = df.withColumn('lineage_num_previous_flights', F.count('*').over(window_spec_cumulative))
     df = df.withColumn('lineage_avg_delay_previous_flights', F.avg(dep_delay_col).over(window_spec_cumulative))
     df = df.withColumn('lineage_max_delay_previous_flights', F.max(dep_delay_col).over(window_spec_cumulative))

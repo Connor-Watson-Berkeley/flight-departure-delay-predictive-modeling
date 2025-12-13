@@ -29,7 +29,7 @@ from xgboost.spark import SparkXGBRegressor
 # CONFIGURATION
 # -------------------------
 # List of versions to process (e.g., ["3M", "12M", "60M", "XM"])
-VERSIONS = ["3M","60M","12M"]  # <-- EDIT THIS LIST
+VERSIONS = ["60M"]  # <-- EDIT THIS LIST
 
 INPUT_FOLDER = "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed"
 OUTPUT_FOLDER = "dbfs:/mnt/mids-w261/student-groups/Group_4_2/processed"
@@ -510,8 +510,34 @@ def compute_meta_model_predictions(train_df, val_df, model_id="RF_1", verbose=Tr
     # Get shared feature lists (all models use the same features)
     categorical_features, numerical_features = _get_shared_features(train_with_meta)
     
+    # CRITICAL: Filter out categorical features that are all NULL
+    # StringIndexer cannot handle columns where all values are NULL
+    valid_categorical_features = []
+    invalid_categorical_features = []
+    
+    for cat_col in categorical_features:
+        if cat_col in train_with_meta.columns:
+            # Check if column has any non-null values
+            non_null_count = train_with_meta.filter(col(cat_col).isNotNull()).count()
+            total_count = train_with_meta.count()
+            
+            if non_null_count > 0:
+                valid_categorical_features.append(cat_col)
+            else:
+                invalid_categorical_features.append(cat_col)
+                if verbose:
+                    print(f"  ⚠ Excluding categorical feature '{cat_col}' (all values are NULL)")
+        else:
+            invalid_categorical_features.append(cat_col)
+            if verbose:
+                print(f"  ⚠ Excluding categorical feature '{cat_col}' (column not found)")
+    
+    categorical_features = valid_categorical_features
+    
     if verbose:
         print(f"  Shared features: {len(categorical_features)} categorical, {len(numerical_features)} numerical")
+        if invalid_categorical_features:
+            print(f"  Excluded {len(invalid_categorical_features)} categorical features (all NULL or missing)")
     
     # CRITICAL: Cast numerical features to numeric types before preprocessing
     # Some features (especially weather features) may be loaded as strings, but Imputer requires numeric types
@@ -881,13 +907,26 @@ def _get_shared_features(df):
         'is_first_flight', 'is_jump',
         'prev_flight_origin', 'prev_flight_dest',
         'prev_flight_month', 'prev_flight_op_carrier',
-        'prev_flight_day_of_week'
+        'prev_flight_day_of_week',
+        # Hour features - extract hour from departure time if available
+        # These help capture time-of-day patterns (e.g., morning vs evening operations)
+        'dep_time_blk',  # Hour block of current flight departure (if available)
+        # NOTE: prev_flight_hourlypresentweathertype, prev_flight_hourlyskyconditions, and
+        # prev_flight_dailyweather were categorical weather features that were incorrectly
+        # cast to numeric in previous versions. Removed to avoid confusion.
     ]
     
     numerical_features = [
         'prev_flight_distance', 'prev_flight_crs_elapsed_time',
         'prev_flight_origin_hourlywindspeed', 'prev_flight_dest_hourlywindspeed',
-        'prev_flight_origin_elevation', 'prev_flight_dest_elevation'
+        'prev_flight_origin_elevation', 'prev_flight_dest_elevation',
+        # Scheduled duration features - these are data leakage-free and provide baseline expectations
+        # Scheduled rotation time: scheduled prev departure to scheduled current departure
+        'scheduled_lineage_rotation_time_minutes',
+        # Scheduled turnover time: scheduled prev arrival to scheduled current departure
+        'scheduled_lineage_turnover_time_minutes',
+        # Scheduled flight time for previous flight (scheduled arrival - scheduled departure)
+        'prev_flight_scheduled_flight_time_minutes',
     ]
     
     # Add graph features if available
@@ -926,8 +965,8 @@ def _get_shared_features(df):
         # PRECIPITATION & VISIBILITY (High Impact - 20-30% of weather-related delay variance)
         'prev_flight_hourlyprecipitation',       # Flight path deviations, approach restrictions
         'prev_flight_hourlyvisibility',          # Approach procedures, landing restrictions
-        'prev_flight_hourlypresentweathertype',   # Categorical weather conditions
-        'prev_flight_hourlyskyconditions',       # Cloud cover, approach restrictions
+        # NOTE: prev_flight_hourlypresentweathertype and prev_flight_hourlyskyconditions are categorical
+        # and should NOT be in numerical_features. They are excluded from this list.
         'prev_flight_dailyprecipitation',        # Aggregate precipitation impact
         
         # TEMPERATURE & PRESSURE (Moderate Impact - 10-20% of weather-related delay variance)
