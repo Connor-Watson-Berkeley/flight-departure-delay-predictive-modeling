@@ -230,17 +230,31 @@ class FlightDelayDataLoader:
         for v in VERSIONS:
             try:
                 self.folds[v] = self._load_version(v)
+                print(f"✓ Successfully loaded version '{v}' (suffix: '{self.suffix}')")
             except Exception as e:
                 # Skip versions that don't exist or can't be loaded
                 error_msg = str(e)
-                if "PATH_NOT_FOUND" in error_msg or "does not exist" in error_msg:
+                if "PATH_NOT_FOUND" in error_msg or "does not exist" in error_msg or "Path does not exist" in error_msg:
                     print(f"⚠ Skipping version '{v}' - files not found (suffix: '{self.suffix}')")
                 else:
                     # Re-raise if it's a different error (permissions, etc.)
+                    print(f"❌ Error loading version '{v}': {error_msg}")
                     raise
 
     def get_version(self, version):
+        """Get folds for a specific version."""
+        if version not in self.folds:
+            available = list(self.folds.keys())
+            raise KeyError(
+                f"Version '{version}' not found in loaded folds. "
+                f"Available versions: {available}. "
+                f"Make sure you've called load() and that the version exists for source='{self.source}' and suffix='{self.suffix}'"
+            )
         return self.folds[version]
+    
+    def list_loaded_versions(self):
+        """List all versions that were successfully loaded."""
+        return list(self.folds.keys())
     
     def get_valid_numerical_features(self, df, sample_size=10000):
         """
@@ -409,12 +423,21 @@ class FlightDelayCV:
         self.version = version
         if dataloader:
             self.data_loader = dataloader
+            # If dataloader is provided, ensure it's loaded
+            if not self.data_loader.folds:
+                print("⚠ DataLoader provided but not loaded. Calling load()...")
+                self.data_loader.load()
+            else:
+                # Diagnostic: show what versions are loaded
+                loaded_versions = list(self.data_loader.folds.keys())
+                print(f"✓ DataLoader provided with {len(loaded_versions)} loaded version(s): {loaded_versions}")
         else:
             self.data_loader = FlightDelayDataLoader()
             self.data_loader.load()
 
         self.evaluator = FlightDelayEvaluator()
         
+        # Get folds for the specified version
         self.folds = self.data_loader.get_version(version)
 
         self.metrics = []
