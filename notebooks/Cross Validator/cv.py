@@ -424,6 +424,126 @@ class FlightDelayCV:
         self.fit_results = None  # Store results DataFrame from fit()
         self.evaluate_results = None  # Store results DataFrame from evaluate()
     
+    def fit_fold(self, fold_index: int):
+        # Fit only for a particular fold instead of all folds. 
+        # ---- Validate fold index ----
+        if not isinstance(fold_index, int):
+            raise TypeError("fold_index must be an integer")
+
+        if fold_index < 0 or fold_index >= len(self.folds) - 1:
+            raise ValueError(
+                f"Invalid fold_index {fold_index}. "
+                f"Valid range is [0, {len(self.folds) - 2}]"
+            )
+
+        results = []
+
+        train_df, val_df = self.folds[fold_index]
+
+        # ---- Set version / fold index on estimator ----
+        if hasattr(self.estimator, 'setVersion'):
+            self.estimator.setVersion(self.version)
+
+        if hasattr(self.estimator, 'setFoldIndex'):
+            self.estimator.setFoldIndex(fold_index)
+
+        if hasattr(self.estimator, 'stages'):
+            for stage in self.estimator.getStages():
+                if hasattr(stage, 'setVersion'):
+                    stage.setVersion(self.version)
+                if hasattr(stage, 'setFoldIndex'):
+                    stage.setFoldIndex(fold_index)
+
+        # ---- Train model ----
+        model = self.estimator.fit(train_df)
+
+        # ---- Evaluate ----
+        train_preds = model.transform(train_df)
+        train_metric = self.evaluator.evaluate(train_preds)
+
+        val_preds = model.transform(val_df)
+        val_metric = self.evaluator.evaluate(val_preds)
+
+        self.metrics.append(val_metric)
+        self.models.append(model)
+
+        results.append({
+            **{f"{k}_train": v for k, v in train_metric.items()},
+            **{f"{k}_val": v for k, v in val_metric.items()},
+            'fold': f'Fold {fold_index}'
+        })
+
+        # ---- Cleanup (driver-side only, but still important) ----
+        print(f"Cleaning up fold {fold_index}...")
+        spark = SparkSession.builder.getOrCreate()
+        spark.catalog.clearCache()
+
+        try:
+            train_df.unpersist()
+            val_df.unpersist()
+            train_preds.unpersist()
+            val_preds.unpersist()
+        except:
+            pass
+
+        import gc
+        gc.collect()
+        print(f"✓ Fold {fold_index} cleaned up\n")
+
+        # ---- Format results (same schema as fit) ----
+        formatted_results = []
+        for result in results:
+            fold = result['fold']
+            formatted_results.append({
+                'Fold': f"{fold} Train",
+                'rmse': result['rmse_train'],
+                'mae': result.get('mae_train', None),
+                'otpa': result['otpa_train'],
+                'otpa_precision': result.get('otpa_precision_train', None),
+                'otpa_recall': result.get('otpa_recall_train', None),
+                'otpa_f1': result.get('otpa_f1_train', None),
+                'sddr': result['sddr_train'],
+                'sddr_precision': result.get('sddr_precision_train', None),
+                'sddr_recall': result.get('sddr_recall_train', None),
+                'sddr_f1': result.get('sddr_f1_train', None)
+            })
+            formatted_results.append({
+                'Fold': f"{fold} Val",
+                'rmse': result['rmse_val'],
+                'mae': result.get('mae_val', None),
+                'otpa': result['otpa_val'],
+                'otpa_precision': result.get('otpa_precision_val', None),
+                'otpa_recall': result.get('otpa_recall_val', None),
+                'otpa_f1': result.get('otpa_f1_val', None),
+                'sddr': result['sddr_val'],
+                'sddr_precision': result.get('sddr_precision_val', None),
+                'sddr_recall': result.get('sddr_recall_val', None),
+                'sddr_f1': result.get('sddr_f1_val', None)
+            })
+
+        m = pd.DataFrame(formatted_results)
+
+        # ---- Mean / Std (degenerate but compatible) ----
+        train_rows = m[m['Fold'].str.contains('Train')]
+        val_rows = m[m['Fold'].str.contains('Val')]
+
+        mean_train = train_rows.mean(numeric_only=True)
+        std_train = train_rows.std(numeric_only=True)
+
+        mean_val = val_rows.mean(numeric_only=True)
+        std_val = val_rows.std(numeric_only=True)
+
+        summary = pd.concat([
+            m,
+            pd.DataFrame([{'Fold': 'Mean Train', **mean_train.to_dict()}]),
+            pd.DataFrame([{'Fold': 'Std Train', **std_train.to_dict()}]),
+            pd.DataFrame([{'Fold': 'Mean Val', **mean_val.to_dict()}]),
+            pd.DataFrame([{'Fold': 'Std Val', **std_val.to_dict()}]),
+        ], ignore_index=True)
+
+        return summary
+
+
     def fit(self):
         # CV folds only (exclude last test fold)
         results = []

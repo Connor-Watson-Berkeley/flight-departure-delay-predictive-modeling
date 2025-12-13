@@ -23,7 +23,7 @@ from datetime import datetime
 # List of versions to assess (e.g., ["3M", "12M", "60M"])
 VERSIONS = ["60M"]  # <-- EDIT THIS LIST
 
-SOURCE = "CUSTOM"  # Change to "CUSTOM" for CUSTOM data, "OTPW" for OTPW data
+SOURCE = "OTPW"  # Change to "CUSTOM" for CUSTOM data, "OTPW" for OTPW data
 INPUT_SUFFIX = "_with_graph_and_metamodels"  # Suffix for folds with meta-model predictions
 
 # Meta-model IDs to assess (should match what was used in add_meta_model_features.py)
