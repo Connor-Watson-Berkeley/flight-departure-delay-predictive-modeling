@@ -334,7 +334,17 @@ class FlightDelayEvaluator:
         )
         return self.mae_evaluator.evaluate(clean)
 
-    def _calculate_classification_metrics(self, predictions_df, threshold, label_col):
+    def _calculate_classification_metrics(self, predictions_df, threshold, label_col, positive_class_is_one=True):
+        """
+        Calculate classification metrics.
+        
+        Args:
+            predictions_df: DataFrame with predictions and labels
+            threshold: Threshold for converting predictions to binary
+            label_col: Column name for binary label
+            positive_class_is_one: If True, positive class is 1 (delayed). 
+                                  If False, positive class is 0 (on-time).
+        """
         # Null-safe for classification too
         df = predictions_df.dropna(subset=[self.prediction_col, label_col])
 
@@ -344,10 +354,18 @@ class FlightDelayEvaluator:
             F.when(F.col(self.prediction_col) >= threshold, 1).otherwise(0)
         )
 
-        tp = df.filter((F.col(pred_binary_col) == 1) & (F.col(label_col) == 1)).count()
-        fp = df.filter((F.col(pred_binary_col) == 1) & (F.col(label_col) == 0)).count()
-        tn = df.filter((F.col(pred_binary_col) == 0) & (F.col(label_col) == 0)).count()
-        fn = df.filter((F.col(pred_binary_col) == 0) & (F.col(label_col) == 1)).count()
+        if positive_class_is_one:
+            # Positive class = 1 (delayed)
+            tp = df.filter((F.col(pred_binary_col) == 1) & (F.col(label_col) == 1)).count()
+            fp = df.filter((F.col(pred_binary_col) == 1) & (F.col(label_col) == 0)).count()
+            tn = df.filter((F.col(pred_binary_col) == 0) & (F.col(label_col) == 0)).count()
+            fn = df.filter((F.col(pred_binary_col) == 0) & (F.col(label_col) == 1)).count()
+        else:
+            # Positive class = 0 (on-time) - flip the logic
+            tp = df.filter((F.col(pred_binary_col) == 0) & (F.col(label_col) == 0)).count()
+            fp = df.filter((F.col(pred_binary_col) == 0) & (F.col(label_col) == 1)).count()
+            tn = df.filter((F.col(pred_binary_col) == 1) & (F.col(label_col) == 1)).count()
+            fn = df.filter((F.col(pred_binary_col) == 1) & (F.col(label_col) == 0)).count()
 
         total = tp + fp + tn + fn
         precision = tp / (tp + fp) if (tp + fp) else 0.0
@@ -361,11 +379,14 @@ class FlightDelayEvaluator:
     def calculate_otpa_metrics(self, predictions_df):
         """Calculate On-Time Prediction Accuracy (OTPA) metrics.
         
+        For OTPA, the positive class is "on-time" (0), not "delayed" (1).
+        This measures how well we predict on-time flights.
+        
         Returns:
             dict: Contains 'accuracy', 'precision', 'recall', 'f1' for 15-minute threshold
         """
         return self._calculate_classification_metrics(
-            predictions_df, threshold=15, label_col=self.binary_label_col
+            predictions_df, threshold=15, label_col=self.binary_label_col, positive_class_is_one=False
         )
 
     def calculate_sddr_metrics(self, predictions_df):
