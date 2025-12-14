@@ -265,6 +265,44 @@ def filter_to_date_range(df: DataFrame, date_col: str = "fl_date",
     return df_filtered
 
 
+def deduplicate_flights(df: DataFrame, verbose: bool = VERBOSE) -> DataFrame:
+    """
+    Remove duplicate rows (rows that are identical across all columns).
+    
+    When duplicates are found, keeps the first occurrence (deterministic).
+    
+    Args:
+        df: DataFrame to deduplicate
+        verbose: Whether to print verbose output
+        
+    Returns:
+        Deduplicated DataFrame
+    """
+    if verbose:
+        print(f"\n  Deduplicating rows...")
+        initial_count = df.count()
+    
+    # Remove all duplicate rows (rows that are identical across all columns)
+    # This is deterministic based on the order of rows in the DataFrame
+    df_deduped = df.dropDuplicates()
+    
+    if verbose:
+        final_count = df_deduped.count()
+        duplicates_removed = initial_count - final_count
+        duplicate_pct = (duplicates_removed / initial_count * 100) if initial_count > 0 else 0
+        
+        print(f"    Initial rows: {initial_count:,}")
+        print(f"    After deduplication: {final_count:,}")
+        print(f"    Duplicates removed: {duplicates_removed:,} ({duplicate_pct:.2f}%)")
+        
+        if duplicates_removed > 0:
+            print(f"    ✓ Deduplication complete - removed {duplicates_removed:,} duplicate rows")
+        else:
+            print(f"    ✓ No duplicates found")
+    
+    return df_deduped
+
+
 def process_otpw_version(version: str, spark: SparkSession, verbose: bool = VERBOSE) -> DataFrame:
     """
     Process OTPW data for a specific version.
@@ -272,9 +310,10 @@ def process_otpw_version(version: str, spark: SparkSession, verbose: bool = VERB
     Steps:
     1. Load OTPW data
     2. Apply column mapping
-    3. Filter to date range (if 60M, filter to 2015-2019)
-    4. Validate date range
-    5. Return processed DataFrame
+    3. Deduplicate rows (remove duplicate flights)
+    4. Filter to date range (if 60M, filter to 2015-2019)
+    5. Validate date range
+    6. Return processed DataFrame
     
     Args:
         version: Version string ("3M", "12M", or "60M")
@@ -301,6 +340,9 @@ def process_otpw_version(version: str, spark: SparkSession, verbose: bool = VERB
     if verbose:
         print(f"  ✓ Column mapping applied: {len(df_mapped.columns)} columns")
         print(f"    Sample columns: {sorted(df_mapped.columns)[:10]}")
+    
+    # Step 2.5: Deduplicate rows (CRITICAL to prevent data leakage in lineage features)
+    df_mapped = deduplicate_flights(df_mapped, verbose=verbose)
     
     # Step 3: Filter to date range (CRITICAL for 60M)
     if version == "60M":

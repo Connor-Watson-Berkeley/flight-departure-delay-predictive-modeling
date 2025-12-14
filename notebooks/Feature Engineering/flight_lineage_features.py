@@ -119,9 +119,18 @@ def add_flight_lineage_features(df):
     
     # Step 3: Create window specification and rank flights
     print("\nStep 3: Creating window specification and ranking flights...")
-    window_spec = Window.partitionBy(tail_num_col).orderBy(F.col('arrival_timestamp').asc_nulls_last())
+    # Order by arrival_timestamp, then by dep_time, then by fl_date to ensure deterministic ordering
+    # even if there are duplicate rows with the same arrival_timestamp
+    # This ensures LAG(1) always gets the actual previous flight, not a duplicate of the same flight
+    window_spec = Window.partitionBy(tail_num_col).orderBy(
+        F.col('arrival_timestamp').asc_nulls_last(),
+        F.col('dep_time').asc_nulls_last(),  # Tie-breaker 1: departure time
+        F.col('fl_date').asc_nulls_last(),   # Tie-breaker 2: flight date
+        F.col('origin').asc_nulls_last(),    # Tie-breaker 3: origin (for additional determinism)
+        F.col('dest').asc_nulls_last()       # Tie-breaker 4: destination (for additional determinism)
+    )
     df = df.withColumn('lineage_rank', F.row_number().over(window_spec))
-    print("✓ Flights ranked")
+    print("✓ Flights ranked (with deterministic ordering to handle duplicates)")
     
     # Step 4: Get Previous Flight Data Using LAG
     print("\nStep 4: Getting previous flight data using LAG...")
@@ -520,7 +529,14 @@ def _compute_cumulative_features(df, tail_num_col, dep_delay_col):
     # This reduces data leakage risk since we're not using the immediate previous flight's delay
     # Use -2 instead of -1 to exclude the immediate previous flight
     # Handle dep_delay column - use same column as determined above (DEP_DELAY or dep_delay)
-    window_spec_cumulative = Window.partitionBy(tail_num_col).orderBy(F.col('arrival_timestamp').asc_nulls_last()).rowsBetween(Window.unboundedPreceding, -2)
+    # Use same deterministic ordering as main window_spec to handle duplicates consistently
+    window_spec_cumulative = Window.partitionBy(tail_num_col).orderBy(
+        F.col('arrival_timestamp').asc_nulls_last(),
+        F.col('dep_time').asc_nulls_last(),
+        F.col('fl_date').asc_nulls_last(),
+        F.col('origin').asc_nulls_last(),
+        F.col('dest').asc_nulls_last()
+    ).rowsBetween(Window.unboundedPreceding, -2)
     df = df.withColumn('lineage_cumulative_delay', F.sum(dep_delay_col).over(window_spec_cumulative))
     df = df.withColumn('lineage_num_previous_flights', F.count('*').over(window_spec_cumulative))
     df = df.withColumn('lineage_avg_delay_previous_flights', F.avg(dep_delay_col).over(window_spec_cumulative))
